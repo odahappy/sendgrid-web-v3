@@ -55,10 +55,12 @@ if curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/api/health" >/dev/null 2
 else
   echo "WARNING: Cannot access http://127.0.0.1:${APP_PORT}/api/health"
   echo "继续配置 Nginx 和 HTTPS，但请确认项目已经运行在 ${APP_PORT} 端口。"
-  echo "如果后续访问域名出现 502，请执行：sudo systemctl restart sendgrid-web-admin"
+  echo "如果后续访问域名出现 502，请执行：systemctl restart sendgrid-web-admin"
 fi
 
 echo "Creating Nginx reverse proxy config..."
+
+mkdir -p /var/www/html
 
 cat > "/etc/nginx/sites-available/${NGINX_CONF_NAME}" <<EOF
 server {
@@ -89,7 +91,6 @@ server {
 }
 EOF
 
-mkdir -p /var/www/html
 ln -sf "/etc/nginx/sites-available/${NGINX_CONF_NAME}" "/etc/nginx/sites-enabled/${NGINX_CONF_NAME}"
 rm -f /etc/nginx/sites-enabled/default
 
@@ -115,25 +116,24 @@ certbot --nginx \
   --no-eff-email \
   --non-interactive
 
-echo "Testing certificate auto-renew..."
-certbot renew --dry-run
-
 ADMIN_PASSWORD_PRINT=""
 if [ -f "${APP_DIR}/.env" ]; then
   ADMIN_PASSWORD_PRINT="$(grep '^ADMIN_PASSWORD=' "${APP_DIR}/.env" | cut -d= -f2- || true)"
 fi
 
 if [ -z "$ADMIN_PASSWORD_PRINT" ]; then
-  ADMIN_PASSWORD_PRINT="未找到，请执行：sudo grep '^ADMIN_PASSWORD=' ${APP_DIR}/.env"
+  ADMIN_PASSWORD_PRINT="未找到，请执行：grep '^ADMIN_PASSWORD=' ${APP_DIR}/.env"
 fi
 
 echo ""
 echo "============================================================"
 echo "HTTPS installed successfully."
 echo "Access URL: https://${DOMAIN}"
+echo "ADMIN_USERNAME=admin"
 echo "ADMIN_PASSWORD=${ADMIN_PASSWORD_PRINT}"
 echo ""
 echo "App proxy: http://127.0.0.1:${APP_PORT}"
 echo "Nginx config: /etc/nginx/sites-available/${NGINX_CONF_NAME}"
-echo "Certbot renew test: OK"
+echo "Certbot auto renew: enabled"
+echo "Config file: ${APP_DIR}/.env"
 echo "============================================================"
