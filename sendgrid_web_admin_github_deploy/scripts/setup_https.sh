@@ -4,19 +4,20 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 APP_PORT="${APP_PORT:-9000}"
+APP_DIR="${APP_DIR:-/opt/sendgrid-web-admin}"
 NGINX_CONF_NAME="${NGINX_CONF_NAME:-sendgrid-web-admin}"
 
 if [ -z "$DOMAIN" ]; then
   echo "ERROR: DOMAIN is required."
   echo "Example:"
-  echo "DOMAIN=ops.example.com EMAIL=admin@example.com APP_PORT=9000 bash setup_https.sh"
+  echo "curl -fsSL https://raw.githubusercontent.com/odahappy/sendgrid-web-v3/main/sendgrid_web_admin_github_deploy/scripts/setup_https.sh | sudo env DOMAIN=mailops.example.com EMAIL=admin@example.com APP_PORT=9000 bash"
   exit 1
 fi
 
 if [ -z "$EMAIL" ]; then
   echo "ERROR: EMAIL is required."
   echo "Example:"
-  echo "DOMAIN=ops.example.com EMAIL=admin@example.com APP_PORT=9000 bash setup_https.sh"
+  echo "curl -fsSL https://raw.githubusercontent.com/odahappy/sendgrid-web-v3/main/sendgrid_web_admin_github_deploy/scripts/setup_https.sh | sudo env DOMAIN=mailops.example.com EMAIL=admin@example.com APP_PORT=9000 bash"
   exit 1
 fi
 
@@ -25,6 +26,7 @@ echo "Setting up HTTPS for SendGrid Web Admin"
 echo "Domain: ${DOMAIN}"
 echo "Email: ${EMAIL}"
 echo "App port: ${APP_PORT}"
+echo "App dir: ${APP_DIR}"
 echo "============================================================"
 
 echo "Checking port usage..."
@@ -52,7 +54,8 @@ if curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/api/health" >/dev/null 2
   echo "App health check: OK"
 else
   echo "WARNING: Cannot access http://127.0.0.1:${APP_PORT}/api/health"
-  echo "继续配置 Nginx，但请确认项目已经运行在 ${APP_PORT} 端口。"
+  echo "继续配置 Nginx 和 HTTPS，但请确认项目已经运行在 ${APP_PORT} 端口。"
+  echo "如果后续访问域名出现 502，请执行：sudo systemctl restart sendgrid-web-admin"
 fi
 
 echo "Creating Nginx reverse proxy config..."
@@ -63,6 +66,12 @@ server {
     server_name ${DOMAIN};
 
     client_max_body_size 0;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type "text/plain";
+        try_files \$uri =404;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:${APP_PORT};
@@ -80,6 +89,7 @@ server {
 }
 EOF
 
+mkdir -p /var/www/html
 ln -sf "/etc/nginx/sites-available/${NGINX_CONF_NAME}" "/etc/nginx/sites-enabled/${NGINX_CONF_NAME}"
 rm -f /etc/nginx/sites-enabled/default
 
@@ -108,10 +118,21 @@ certbot --nginx \
 echo "Testing certificate auto-renew..."
 certbot renew --dry-run
 
+ADMIN_PASSWORD_PRINT=""
+if [ -f "${APP_DIR}/.env" ]; then
+  ADMIN_PASSWORD_PRINT="$(grep '^ADMIN_PASSWORD=' "${APP_DIR}/.env" | cut -d= -f2- || true)"
+fi
+
+if [ -z "$ADMIN_PASSWORD_PRINT" ]; then
+  ADMIN_PASSWORD_PRINT="未找到，请执行：sudo grep '^ADMIN_PASSWORD=' ${APP_DIR}/.env"
+fi
+
 echo ""
 echo "============================================================"
 echo "HTTPS installed successfully."
 echo "Access URL: https://${DOMAIN}"
+echo "ADMIN_PASSWORD=${ADMIN_PASSWORD_PRINT}"
+echo ""
 echo "App proxy: http://127.0.0.1:${APP_PORT}"
 echo "Nginx config: /etc/nginx/sites-available/${NGINX_CONF_NAME}"
 echo "Certbot renew test: OK"
