@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SendGrid Web Admin Scheduler</title>
+<style>
+:root{--bg:#f5f7fb;--panel:#fff;--text:#182033;--muted:#7b8499;--line:#e6e9f2;--primary:#316bff;--success:#18a058;--warning:#f0a020;--danger:#d03050;--side:#121826;--radius:14px}
+*{box-sizing:border-box}body{margin:0;font-family:Arial,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+.app{display:flex;min-height:100vh}.sidebar{width:250px;background:linear-gradient(180deg,#121826,#1b2437);color:white;position:fixed;top:0;bottom:0;left:0;padding:20px 14px;overflow:auto}.brand{display:flex;gap:12px;align-items:center;margin-bottom:22px}.logo{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#316bff,#7c3aed);display:grid;place-items:center;font-weight:900}.brand h2{font-size:16px;margin:0}.brand p{font-size:12px;color:#aab3c7;margin:3px 0 0}.nav button{display:block;width:100%;border:0;background:transparent;color:#dce3f4;text-align:left;padding:12px;border-radius:12px;cursor:pointer;font-size:14px}.nav button:hover,.nav button.active{background:rgba(255,255,255,.1);color:#fff}.main{margin-left:250px;width:calc(100% - 250px)}.top{height:72px;display:flex;align-items:center;justify-content:space-between;padding:0 26px;border-bottom:1px solid var(--line);background:rgba(245,247,251,.92);position:sticky;top:0;z-index:2}h1{font-size:22px;margin:0}.desc{color:var(--muted);font-size:13px;margin-top:4px}.content{padding:24px}.section{display:none}.section.active{display:block}.grid{display:grid;gap:16px}.g6{grid-template-columns:repeat(6,1fr)}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}.card{background:white;border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:0 10px 28px rgba(24,32,51,.06);margin-bottom:16px}.metric .num{font-size:28px;font-weight:900;margin-top:6px}.muted{color:var(--muted);font-size:13px}.toolbar{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:14px}.btn{height:36px;border:1px solid var(--line);background:#fff;border-radius:10px;padding:0 12px;cursor:pointer;font-weight:700;text-decoration:none;color:#182033;display:inline-flex;align-items:center}.primary{background:var(--primary);border-color:var(--primary);color:white}.danger{background:var(--danger);border-color:var(--danger);color:white}.warn{background:var(--warning);border-color:var(--warning);color:white}.success{background:var(--success);border-color:var(--success);color:white}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;background:#f8f9fc;color:#626b80;padding:11px;border-bottom:1px solid var(--line);white-space:nowrap}td{padding:11px;border-bottom:1px solid var(--line);vertical-align:middle}.badge{display:inline-block;border-radius:99px;padding:4px 9px;font-size:12px;font-weight:800}.active-b{background:#e8f7ef;color:#0f7a3d}.risk-b{background:#ffe9ee;color:#b10f2e}.info-b{background:#eaf0ff;color:#2453d4}.gray-b{background:#eef1f6;color:#5f6678}.paused-b{background:#fff4df;color:#9a5b00}.code{font-family:Consolas,monospace;background:#f2f4f8;border:1px solid #e0e5ef;border-radius:8px;padding:2px 6px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}.field{margin-bottom:0}.field.full{grid-column:1/-1}label{display:block;font-size:12px;color:var(--muted);font-weight:800;margin-bottom:6px}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:11px;padding:10px;background:#fff;min-height:40px}textarea{min-height:90px}.range{display:grid;grid-template-columns:1fr 1fr;gap:8px}.hint{font-size:12px;color:var(--muted);line-height:1.6}.modal{display:none;position:fixed;inset:0;background:rgba(18,24,38,.45);z-index:10;align-items:center;justify-content:center;padding:24px}.modal.show{display:flex}.modalbox{width:min(920px,96vw);max-height:90vh;overflow:auto;background:white;border-radius:18px;padding:22px}.modalhead{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}.modalhead h2{margin:0}.close{border:1px solid var(--line);background:white;border-radius:10px;width:34px;height:34px;font-size:18px;cursor:pointer}.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}.small{font-size:12px;color:#7b8499}.varbox{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.var{background:#f8f9fc;border:1px solid var(--line);border-radius:12px;padding:13px}.top-actions{display:flex;gap:10px;align-items:center}.nowrap{white-space:nowrap}.table-wrap{overflow:auto}.schedule-tag{border:1px solid var(--line);border-radius:14px;margin-bottom:16px;background:#fff}.schedule-tag-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:14px 16px;border-bottom:1px solid var(--line);background:#fafbff;border-radius:14px 14px 0 0}.schedule-stat{display:inline-flex;gap:5px;align-items:center;margin-left:8px;font-size:12px;color:var(--muted)}.schedule-plan-title{font-weight:900}.detail-modal .modalbox{width:min(1280px,98vw)}.html-editor-modal .modalbox{width:min(1180px,98vw)}.html-code-editor{min-height:60vh;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre;tab-size:2}.file-list-card{margin-top:16px;border-top:1px solid var(--line);padding-top:14px}.date-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 14px}.date-tab{height:34px;border:1px solid var(--line);background:#fff;border-radius:999px;padding:0 12px;cursor:pointer;font-weight:800;color:#465066}.date-tab.active{background:var(--primary);border-color:var(--primary);color:#fff}.date-pane{display:none}.date-pane.active{display:block}.detail-summary{background:#f8f9fc;border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:12px}
+@media(max-width:1200px){.g6{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(2,1fr)}}@media(max-width:900px){.g6,.g4,.g3,.g2,.form-grid,.varbox{grid-template-columns:1fr}.sidebar{position:static;width:100%}.main{margin-left:0;width:100%}.app{display:block}.top{height:auto;padding:16px;align-items:flex-start}.modalbox{width:98vw}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="sidebar"><div class="brand"><div class="logo">SG</div><div><h2>SendGrid Web Admin</h2><p>多通道 · 多代理 · 随机任务</p></div></div><div class="nav"><button class="active" onclick="showSec('dashboard',this)">📊 仪表盘</button><button onclick="showSec('tags',this)">🏷️ 标签</button><button onclick="showSec('channels',this)">🔑 API 通道</button><button onclick="showSec('proxies',this)">🌐 代理</button><button onclick="showSec('recipients',this)">👥 收件人</button><button onclick="showSec('templates',this)">🧩 HTML 模板</button><button onclick="showSec('tasks',this)">⏱️ 任务</button><button onclick="showSec('schedule',this)">📅 发送计划</button><button onclick="showSec('logs',this)">🧾 日志</button><button onclick="showSec('users',this)">👤 团队成员</button></div></aside>
+<main class="main"><header class="top"><div><h1 id="title">仪表盘</h1><div class="desc">网页设置 API、代理、收件人和随机定时任务</div></div><div class="top-actions">{% if current_user.role == 'admin' %}<button id="topAddUserBtn" class="btn primary" style="display:none;" onclick="openModal('userModal')">新增成员</button>{% endif %}<span class="badge info-b">{{ current_user.display_name or current_user.username }} / {{ current_user.role }}</span><a class="btn" href="/">刷新</a><a class="btn" href="/logout">退出</a></div></header><div class="content">
+
+<section id="dashboard" class="section active">
+  <div class="grid g4"><div class="card metric"><div class="muted">已计划</div><div class="num">{{ stats.total_scheduled }}</div></div><div class="card metric"><div class="muted">已发送任务</div><div class="num">{{ stats.total_sent }}</div></div><div class="card metric"><div class="muted">待发送任务</div><div class="num">{{ stats.total_pending }}</div></div><div class="card metric"><div class="muted">启用通道</div><div class="num">{{ stats.active_channels }}</div></div><div class="card metric"><div class="muted">团队成员</div><div class="num">{{ stats.active_users }}</div></div></div>
+  <div class="card"><div class="toolbar"><div><strong>SendGrid 统计概览</strong><div class="hint">到达、打开、点击、拒绝、投诉需要配置 SendGrid Event Webhook 后才会增长。</div></div><span class="badge info-b">类似 SendGrid 首页统计</span></div><div class="grid g6"><div class="card metric"><div class="muted">发送数量</div><div class="num">{{ sg_metrics.sent }}</div></div><div class="card metric"><div class="muted">到达数量</div><div class="num">{{ sg_metrics.delivered }}</div></div><div class="card metric"><div class="muted">打开数量</div><div class="num">{{ sg_metrics.opened }}</div></div><div class="card metric"><div class="muted">点击数量</div><div class="num">{{ sg_metrics.clicked }}</div></div><div class="card metric"><div class="muted">拒绝数量</div><div class="num">{{ sg_metrics.rejected }}</div></div><div class="card metric"><div class="muted">投诉数量</div><div class="num">{{ sg_metrics.complaints }}</div></div></div></div>
+  <div class="card"><div class="toolbar"><strong>变量规则</strong><span class="badge info-b">主题与正文同步</span></div><div class="varbox"><div class="var"><b>{{ '{{from_mail}}' }}</b><div class="hint">发件人邮箱，来自当前通道绑定的 From Email。</div></div><div class="var"><b>{{ '{{to_email}}' }}</b><div class="hint">收件人邮箱，来自列表。</div></div><div class="var"><b>{{ '{{code8}}' }}</b><div class="hint">生成计划时保存的 8 位数字，主题和正文一致，重试不变。</div></div></div></div>
+</section>
+
+<section id="tags" class="section"><div class="card"><div class="toolbar"><div><strong>标签 / 项目</strong><div class="hint">点击“查看细节”可查看该标签下绑定的通道、代理、收件人池、HTML模板、任务、发送计划和发送日志汇总。</div></div><button class="btn primary" onclick="openModal('tagModal')">新建标签</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>名称</th><th>类型</th><th>状态</th><th>备注</th><th>创建时间</th><th>操作</th></tr></thead><tbody>{% for x in tags %}<tr><td>{{x.id}}</td><td><b>{{x.name}}</b></td><td><span class="badge info-b">{{x.service_type}}</span></td><td>{{x.status}}</td><td>{{x.remark or ''}}</td><td>{{x.created_at or '-'}}</td><td><button type="button" class="btn primary" data-tag-id="{{x.id}}" data-tag-name="{{x.name}}" onclick="openTagDetails(this)">查看细节</button></td></tr>{% endfor %}</tbody></table></div></div></section>
+
+<section id="channels" class="section"><div class="card"><div class="toolbar"><strong>API 通道</strong><button class="btn primary" onclick="openModal('channelModal')">新增通道</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>通道</th><th>标签</th><th>From</th><th>代理</th><th>今日/限额</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for c in channels %}<tr><td>{{c.id}}</td><td><b>{{c.name}}</b></td><td>{{c.tag_name}}</td><td>{{c.from_email}} / {{c.from_name}}</td><td>{{c.proxy_name or '无'}}</td><td>{{c.today_sent}} / {{c.daily_limit}}</td><td><span class="badge active-b">{{c.status}}</span></td><td><button class="btn" onclick="openModal('channelEdit{{c.id}}')">编辑</button></td></tr>{% endfor %}</tbody></table></div></div></section>
+
+<section id="proxies" class="section"><div class="card"><div class="toolbar"><div><strong>代理管理</strong><div class="hint">支持直接输入 <span class="code">209.166.41.146:7723:账号:密码</span>，系统会自动转换为 requests 可识别的代理 URL。</div></div><button class="btn primary" onclick="openModal('proxyModal')">新增代理</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>名称</th><th>代理格式</th><th>状态</th><th>测试结果</th><th>操作</th></tr></thead><tbody>{% for p in proxies %}<tr><td>{{p.id}}</td><td><b>{{p.name}}</b></td><td><span class="code">{{p.proxy_url_preview or '-'}}</span></td><td>{{p.status}}</td><td>{{p.last_test_result or '-'}}</td><td><form method="post" action="/proxies/{{p.id}}/test" onsubmit="return markSubmit(this,'正在测试...')"><button class="btn">主动测试</button></form></td></tr>{% endfor %}</tbody></table></div></div></section>
+
+<section id="recipients" class="section"><div class="card"><div class="toolbar"><div><strong>收件人池/库</strong><div class="hint">收件人分为两个库：0-3天库用于第1-3天，4-30天库用于第4-30天。生成计划时系统会自动从对应库中取邮箱，已加入计划的邮箱会从可用库中移除并标记为 reserved。</div></div><button class="btn primary" onclick="openModal('recipientModal')">上传到收件人库</button></div><div class="table-wrap"><table><thead><tr><th>标签</th><th>库类型</th><th>可用</th><th>已占用</th><th>已发送</th><th>失败</th><th>总数</th><th>最近导入</th></tr></thead><tbody>{% for p in recipient_pool_stats %}<tr><td><span class="badge info-b">🏷️ {{p.tag_name}}</span></td><td><b>{{p.pool_name}}</b><br><span class="small">{{p.pool_type}}</span></td><td><span class="badge active-b">{{p.available_count}}</span></td><td><span class="badge gray-b">{{p.reserved_count}}</span></td><td>{{p.sent_count}}</td><td>{{p.failed_count}}</td><td>{{p.total_count}}</td><td>{{p.last_import_at or '-'}}</td></tr>{% endfor %}</tbody></table></div><div class="hint">说明：这里不会物理删除邮箱；生成计划后状态从 available 变成 reserved，因此前端看起来就是从“可用库”里移除了。任务删除时，未发送的 pending/sending 邮箱会退回 available；已发送和失败邮箱不会自动回库。</div></div></section>
+
+<section id="templates" class="section"><div class="card"><div class="toolbar"><strong>HTML 模板组</strong><button class="btn primary" onclick="openModal('templateModal')">上传模板</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>模板组</th><th>标签</th><th>文件数</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for g in template_groups %}<tr><td>{{g.id}}</td><td><b>{{g.name}}</b></td><td>{{g.tag_name}}</td><td>{{g.file_count}}</td><td>{{g.status}}</td><td class="nowrap"><button class="btn" onclick="openModal('templateEdit{{g.id}}')">编辑</button><form style="display:inline" method="post" action="/templates/{{g.id}}/delete" onsubmit="return confirm('确定删除这个模板组吗？已被任务使用的模板组不会被删除。')"><button class="btn danger">删除</button></form></td></tr>{% endfor %}</tbody></table></div></div></section>
+
+<section id="tasks" class="section"><div class="card"><div class="toolbar"><div><strong>任务管理</strong><div class="hint">新建任务不再选择收件人列表。生成计划时，系统自动按照标签从 0-3天库 和 4-30天库 取邮箱，并检查库存是否足够。</div></div><button class="btn primary" onclick="openModal('taskModal')">新建任务</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>任务</th><th>标签</th><th>通道</th><th>收件人池库存</th><th>计划</th><th>已发</th><th>失败</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for t in tasks %}<tr><td>{{t.id}}</td><td><b>{{t.name}}</b><br><span class="small">{{t.subject_template}}</span></td><td>{{t.tag_name}}</td><td>{{t.channel_name}}</td><td><b>{{t.recipient_list_name}}</b><br><span class="small">0-3天库可用 {{t.pool_0_3_available or 0}} 个；4-30天库可用 {{t.pool_4_30_available or 0}} 个</span></td><td>{{t.scheduled_count}}</td><td>{{t.sent_count}}</td><td>{{t.failed_count}}</td><td><span class="badge gray-b">{{t.status}}</span></td><td class="nowrap"><form style="display:inline" method="post" action="/tasks/{{t.id}}/generate"><button class="btn">生成计划</button></form><form style="display:inline" method="post" action="/tasks/{{t.id}}/regenerate" onsubmit="return confirm('重生成会释放未发送计划并重新从收件人池取邮箱；已有已发送记录的任务不能重生成。确定继续吗？')"><button class="btn warn">重生成</button></form><form style="display:inline" method="post" action="/tasks/{{t.id}}/start"><button class="btn success">启动</button></form><form style="display:inline" method="post" action="/tasks/{{t.id}}/pause"><button class="btn warn">暂停</button></form><form style="display:inline" method="post" action="/tasks/{{t.id}}/delete" onsubmit="return confirm('确定删除这个任务吗？未发送邮箱会退回可用池，已发送/失败邮箱不会自动回库。')"><button class="btn danger">删除</button></form></td></tr>{% endfor %}</tbody></table></div></div></section>
+
+<section id="schedule" class="section"><div class="card"><div class="toolbar"><div><strong>发送计划</strong><div class="hint">按标签分组展示，每个标签下面再按账号/通道形成计划。点击“查看细节”后，系统才会按日期加载明细，避免网页一次性渲染全部邮件造成卡顿。</div></div><span class="hint">共 {{ stats.total_scheduled }} 条计划</span></div>{% if schedule_tag_groups %}{% for tg in schedule_tag_groups %}<div class="schedule-tag"><div class="schedule-tag-head"><div><span class="badge info-b">🏷️ {{tg.tag_name}}</span>{% if tg.service_type %}<span class="small">{{tg.service_type}}</span>{% endif %}</div><div class="nowrap"><span class="schedule-stat">总数 <b>{{tg.total_count}}</b></span><span class="schedule-stat">待发 <b>{{tg.pending_count}}</b></span><span class="schedule-stat">已发 <b>{{tg.sent_count}}</b></span><span class="schedule-stat">失败 <b>{{tg.failed_count}}</b></span></div></div><div class="table-wrap"><table><thead><tr><th>账号计划</th><th>任务</th><th>时间范围</th><th>总数</th><th>待发</th><th>已发</th><th>失败</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for p in tg.plans %}<tr><td><div class="schedule-plan-title">{{p.channel_name}}</div><div class="small">{{p.from_email}}</div></td><td>{{p.task_name}}</td><td>{{p.first_scheduled_at}}<br><span class="small">至 {{p.last_scheduled_at}}</span></td><td>{{p.total_count}}</td><td>{{p.pending_count}}</td><td>{{p.sent_count}}</td><td>{{p.failed_count}}</td><td>{% if p.failed_count > 0 %}<span class="badge risk-b">有失败</span>{% elif p.pending_count > 0 %}<span class="badge info-b">待发送</span>{% else %}<span class="badge active-b">已完成</span>{% endif %}</td><td><button type="button" class="btn primary" data-tag-id="{{p.tag_id}}" data-task-id="{{p.task_id}}" data-channel-id="{{p.channel_id}}" data-from-email="{{p.from_email}}" data-title="{{tg.tag_name}} / {{p.channel_name}}" data-subtitle="任务：{{p.task_name}}；账号：{{p.from_email}}；共 {{p.total_count}} 条明细" onclick="openScheduleDetails(this)">查看细节</button></td></tr>{% endfor %}</tbody></table></div></div>{% endfor %}{% else %}<div class="hint">暂无发送计划。请先在任务管理中生成计划。</div>{% endif %}</div></section>
+
+<section id="logs" class="section"><div class="card"><div class="toolbar"><div><strong>发送日志</strong><div class="hint">按单个任务/账号汇总展示，点击“查看细节”后再按日期加载日志明细，避免打开后台时卡顿。</div></div><span class="hint">最多显示最近 100 个任务日志组</span></div>{% if log_task_groups %}<div class="table-wrap"><table><thead><tr><th>标签</th><th>任务/账号</th><th>日志时间范围</th><th>总数</th><th>成功</th><th>失败</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for g in log_task_groups %}<tr><td><span class="badge info-b">🏷️ {{g.tag_name}}</span></td><td><b>{{g.task_name}}</b><br><span class="small">{{g.channel_name}}{% if g.from_email %} / {{g.from_email}}{% endif %}</span></td><td>{{g.first_created_at}}<br><span class="small">至 {{g.last_created_at}}</span></td><td>{{g.total_count}}</td><td>{{g.sent_count}}</td><td>{{g.failed_count}}</td><td>{% if g.failed_count > 0 %}<span class="badge risk-b">有失败</span>{% elif g.sent_count > 0 %}<span class="badge active-b">正常</span>{% else %}<span class="badge gray-b">无成功</span>{% endif %}</td><td><button type="button" class="btn primary" data-task-id="{{g.task_id or ''}}" data-channel-id="{{g.channel_id or ''}}" data-title="{{g.tag_name}} / {{g.task_name}}" data-subtitle="账号：{{g.channel_name}}{% if g.from_email %} / {{g.from_email}}{% endif %}；共 {{g.total_count}} 条发送日志" onclick="openLogDetails(this)">查看细节</button></td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="hint">暂无发送日志。</div>{% endif %}</div></section>
+
+<div class="modal detail-modal" id="scheduleDetailModal"><div class="modalbox"><div class="modalhead"><div><h2 id="scheduleDetailTitle">发送计划细节</h2><div class="hint" id="scheduleDetailSub">按日期标签加载明细。</div></div><button class="close" onclick="closeModal('scheduleDetailModal')">×</button></div><div class="detail-summary" id="scheduleDetailSummary">正在加载日期...</div><div class="date-tabs" id="scheduleDateTabs"></div><div id="scheduleRowsBox" class="table-wrap"></div><div class="actions"><button type="button" class="btn" onclick="closeModal('scheduleDetailModal')">关闭</button></div></div></div>
+<div class="modal detail-modal" id="logDetailModal"><div class="modalbox"><div class="modalhead"><div><h2 id="logDetailTitle">发送日志细节</h2><div class="hint" id="logDetailSub">按日期标签加载明细。</div></div><button class="close" onclick="closeModal('logDetailModal')">×</button></div><div class="detail-summary" id="logDetailSummary">正在加载日期...</div><div class="date-tabs" id="logDateTabs"></div><div id="logRowsBox" class="table-wrap"></div><div class="actions"><button type="button" class="btn" onclick="closeModal('logDetailModal')">关闭</button></div></div></div>
+
+<section id="users" class="section"><div class="card"><div class="toolbar"><div><strong>团队成员</strong><div class="hint">添加团队成员共同使用后台。admin 可以创建和修改成员；member 可以登录后台使用基础功能。</div></div></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>账号</th><th>显示名称</th><th>角色</th><th>状态</th><th>最近登录</th><th>创建时间</th><th>操作</th></tr></thead><tbody>{% for u in users %}<tr><td>{{u.id}}</td><td><b>{{u.username}}</b></td><td>{{u.display_name or ''}}</td><td><span class="badge info-b">{{u.role}}</span></td><td><span class="badge {% if u.status=='active' %}active-b{% else %}paused-b{% endif %}">{{u.status}}</span></td><td>{{u.last_login_at or '-'}}</td><td>{{u.created_at}}</td><td>{% if current_user.role == 'admin' %}<button class="btn" onclick="openModal('userEdit{{u.id}}')">编辑</button>{% else %}<span class="small">无权限</span>{% endif %}</td></tr>{% endfor %}</tbody></table></div></div></section>
+
+</div></main></div>
+
+<div class="modal" id="tagModal"><div class="modalbox"><div class="modalhead"><h2>新建标签</h2><button class="close" onclick="closeModal('tagModal')">×</button></div><form method="post" action="/tags/create"><div class="form-grid"><div class="field"><label>名称</label><input name="name" required></div><div class="field"><label>服务类型</label><select name="service_type"><option>transactional</option><option>notification</option><option>marketing</option><option>test</option></select></div><div class="field full"><label>备注</label><textarea name="remark"></textarea></div></div><div class="actions"><button class="btn primary">保存</button></div></form></div></div>
+
+<div class="modal detail-modal" id="tagDetailModal"><div class="modalbox"><div class="modalhead"><div><h2 id="tagDetailTitle">标签细节</h2><div class="hint" id="tagDetailSub">展示该标签/项目下的整体内容汇总。</div></div><button class="close" onclick="closeModal('tagDetailModal')">×</button></div><div id="tagDetailBody"><div class="detail-summary">正在加载标签细节...</div></div></div></div>
+<div class="modal" id="proxyModal"><div class="modalbox"><div class="modalhead"><div><h2>新增代理</h2><div class="hint">可直接粘贴四段格式，保存时会自动转换：<span class="code">209.166.41.146:7723:UabypmyIMJtp:Ml2NwgJZp4Ss</span> → <span class="code">http://账号:密码@IP:端口</span></div></div><button class="close" onclick="closeModal('proxyModal')">×</button></div><form method="post" action="/proxies/create" onsubmit="return markSubmit(this,'保存并测试中...')"><div class="form-grid"><div class="field"><label>代理名称</label><input name="name" required></div><div class="field full"><label>代理地址 / 自动读取转换格式</label><input name="proxy_url" id="proxyUrlInput" placeholder="209.166.41.146:7723:账号:密码 或 http://user:pass@ip:port 或 socks5://user:pass@ip:port" oninput="previewProxyFormat()"><div class="hint">转换预览：<span class="code" id="proxyPreview">-</span></div></div><div class="field full"><label style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="test_now" value="1" checked style="width:auto;min-height:auto"> 保存后立即主动测试代理</label><div class="hint">测试会通过代理访问外部 IP 检测接口，成功时会显示出口 IP 和耗时。</div></div></div><div class="actions"><button class="btn primary">保存代理</button></div></form></div></div>
+<div class="modal" id="channelModal"><div class="modalbox"><div class="modalhead"><h2>新增 API 通道</h2><button class="close" onclick="closeModal('channelModal')">×</button></div><form method="post" action="/channels/create"><div class="form-grid"><div class="field"><label>标签</label><select name="tag_id">{% for t in tags %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select></div><div class="field"><label>通道名称</label><input name="name" required></div><div class="field full"><label>SendGrid API Key</label><input name="api_key" type="password" required></div><div class="field"><label>发件人邮箱 from_mail</label><input name="from_email" required></div><div class="field"><label>发件人名称</label><input name="from_name"></div><div class="field"><label>代理</label><select name="proxy_id"><option value="">不使用代理</option>{% for p in proxies %}<option value="{{p.id}}">{{p.name}}</option>{% endfor %}</select></div><div class="field"><label>每日限额</label><input name="daily_limit" value="500"></div></div><div class="actions"><button class="btn primary">保存</button></div></form></div></div>
+{% for c in channels %}<div class="modal" id="channelEdit{{c.id}}"><div class="modalbox"><div class="modalhead"><div><h2>编辑 API 通道</h2><div class="hint">API Key 留空表示不修改原来的 Key。</div></div><button class="close" onclick="closeModal('channelEdit{{c.id}}')">×</button></div><form method="post" action="/channels/{{c.id}}/update"><div class="form-grid"><div class="field"><label>标签</label><select name="tag_id">{% for t in tags %}<option value="{{t.id}}" {% if t.id==c.tag_id %}selected{% endif %}>{{t.name}}</option>{% endfor %}</select></div><div class="field"><label>通道名称</label><input name="name" value="{{c.name}}" required></div><div class="field full"><label>新 SendGrid API Key，可留空</label><input name="api_key" type="password" placeholder="留空则不修改"></div><div class="field"><label>发件人邮箱 from_mail</label><input name="from_email" value="{{c.from_email}}" required></div><div class="field"><label>发件人名称</label><input name="from_name" value="{{c.from_name or ''}}"></div><div class="field"><label>代理</label><select name="proxy_id"><option value="">不使用代理</option>{% for p in proxies %}<option value="{{p.id}}" {% if c.proxy_id==p.id %}selected{% endif %}>{{p.name}}</option>{% endfor %}</select></div><div class="field"><label>每日限额</label><input name="daily_limit" value="{{c.daily_limit}}"></div><div class="field"><label>状态</label><select name="status"><option value="active" {% if c.status=='active' %}selected{% endif %}>active</option><option value="paused" {% if c.status=='paused' %}selected{% endif %}>paused</option><option value="disabled" {% if c.status=='disabled' %}selected{% endif %}>disabled</option><option value="risk_hold" {% if c.status=='risk_hold' %}selected{% endif %}>risk_hold</option></select></div></div><div class="actions"><button class="btn primary">保存修改</button></div></form></div></div>{% endfor %}
+<div class="modal" id="recipientModal"><div class="modalbox"><div class="modalhead"><h2>上传收件人到库</h2><button class="close" onclick="closeModal('recipientModal')">×</button></div><form method="post" action="/recipients/upload" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>标签</label><select name="tag_id">{% for t in tags %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select></div><div class="field"><label>库类型</label><select name="pool_type" required><option value="warmup_0_3">0-3天库（第1-3天使用）</option><option value="warmup_4_30">4-30天库（第4-30天使用）</option></select></div><div class="field"><label>来源名称/备注</label><input name="name" placeholder="例如 7月第一批0-3天库"></div><div class="field full"><label>TXT/CSV 文件，可多选</label><input type="file" name="files" accept=".txt,.csv" multiple required></div></div><div class="hint">格式：每行一个邮箱，或 email,name。支持一次选择多个 TXT/CSV 文件；收件人池上传已解除大小限制，不再使用 MAX_RECIPIENT_UPLOAD_BYTES 限制；重复邮箱会自动忽略。</div><div class="actions"><button class="btn primary">上传并导入</button></div></form></div></div>
+<div class="modal" id="templateModal"><div class="modalbox"><div class="modalhead"><h2>上传 HTML 模板组</h2><button class="close" onclick="closeModal('templateModal')">×</button></div><form method="post" action="/templates/upload" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>标签</label><select name="tag_id">{% for t in tags %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select></div><div class="field"><label>模板组名称</label><input name="name" required></div><div class="field full"><label>HTML 文件，可多选</label><input type="file" name="files" multiple required></div></div><div class="hint">支持变量：{{ '{{from_mail}}' }}、{{ '{{to_email}}' }}、{{ '{{code8}}' }}。</div><div class="actions"><button class="btn primary">上传模板</button></div></form></div></div>
+{% for g in template_groups %}<div class="modal" id="templateEdit{{g.id}}"><div class="modalbox"><div class="modalhead"><div><h2>编辑 HTML 模板组</h2><div class="hint">这里可以修改模板组信息，也可以点击单个文件的“编辑HTML编码”打开 TXT 代码窗口。</div></div><button class="close" onclick="closeModal('templateEdit{{g.id}}')">×</button></div><form method="post" action="/templates/{{g.id}}/update"><div class="form-grid"><div class="field"><label>标签</label><select name="tag_id">{% for t in tags %}<option value="{{t.id}}" {% if t.id==g.tag_id %}selected{% endif %}>{{t.name}}</option>{% endfor %}</select></div><div class="field"><label>模板组名称</label><input name="name" value="{{g.name}}" required></div><div class="field"><label>状态</label><select name="status"><option value="active" {% if g.status=='active' %}selected{% endif %}>active</option><option value="paused" {% if g.status=='paused' %}selected{% endif %}>paused</option><option value="disabled" {% if g.status=='disabled' %}selected{% endif %}>disabled</option></select></div><div class="field"><label>文件数</label><input value="{{g.file_count}}" disabled></div></div><div class="actions"><button class="btn primary">保存模板组信息</button></div></form><div class="file-list-card"><div class="toolbar"><div><strong>HTML 文件编码</strong><div class="hint">点击编辑按钮后，会弹出 TXT 大文本框，可直接修改 HTML 源码。</div></div><span class="badge info-b">{{g.file_count}} 个文件</span></div>{% if g.files %}<div class="table-wrap"><table><thead><tr><th>ID</th><th>文件名</th><th>大小</th><th>退订标记</th><th>创建时间</th><th>操作</th></tr></thead><tbody>{% for f in g.files %}<tr><td>{{f.id}}</td><td><b>{{f.filename}}</b><br><span class="small">{{f.file_path}}</span></td><td>{{f.content_size}} bytes</td><td>{% if f.has_unsubscribe %}<span class="badge active-b">yes</span>{% else %}<span class="badge gray-b">no</span>{% endif %}</td><td>{{f.created_at}}</td><td><button type="button" class="btn" onclick="openModal('{{f.modal_id}}')">编辑HTML编码</button></td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="hint">这个模板组下面还没有 HTML 文件。</div>{% endif %}</div></div></div>{% for f in g.files %}<div class="modal html-editor-modal" id="{{f.modal_id}}"><div class="modalbox"><div class="modalhead"><div><h2>编辑 HTML 编码</h2><div class="hint">模板组：{{g.name}}；文件：{{f.filename}}；保存后直接覆盖当前 HTML 文件。</div></div><button class="close" onclick="closeModal('{{f.modal_id}}')">×</button></div><form method="post" action="/templates/files/{{f.id}}/update"><div class="field full"><label>HTML 源码 TXT 编辑窗口</label><textarea class="html-code-editor" name="html_content" spellcheck="false">{{f.content}}</textarea></div><div class="hint">支持变量：{{ '{{from_mail}}' }}、{{ '{{to_email}}' }}、{{ '{{code8}}' }}。注意：保存后，新生成计划和后续发送会读取修改后的文件内容。</div><div class="actions"><button type="button" class="btn" onclick="closeModal('{{f.modal_id}}')">取消</button><button class="btn primary">保存 HTML 编码</button></div></form></div></div>{% endfor %}{% endfor %}
+<div class="modal" id="taskModal"><div class="modalbox"><div class="modalhead"><div><h2>新建任务</h2><div class="hint">新建任务只选择标签、通道和模板。生成计划时系统自动从该标签对应的两个收件人库取邮箱。</div></div><button class="close" onclick="closeModal('taskModal')">×</button></div><form method="post" action="/tasks/create"><div class="form-grid"><div class="field"><label>标签</label><select name="tag_id">{% for t in tags %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select></div><div class="field"><label>通道/API</label><select name="channel_id">{% for c in channels %}<option value="{{c.id}}">{{c.name}} / {{c.from_email}}</option>{% endfor %}</select></div><div class="field"><label>任务名称</label><input name="name" required></div><div class="field"><label>主题模板</label><input name="subject_template" value="Your notification - {{ '{{code8}}' }}" required></div><div class="field full"><label>HTML 模板组</label><select name="template_group_id">{% for g in template_groups %}<option value="{{g.id}}">{{g.name}}</option>{% endfor %}</select></div><div class="field full"><label>计划速度说明</label><textarea readonly>生成计划时会自动从两个收件人库取邮箱：
+0-3天库：用于第 1 天、第 2 天、第 3 天
+4-30天库：用于第 4 天到第 30 天
+
+排期规则：
+第 1 天：60 封内，实际随机 45-60
+第 2 天：200 封内，实际随机 185-200
+第 3 天：700 封内，实际随机 685-700
+第 4-30 天：每天 1000 封内，实际随机 985-1000
+
+生成计划前会检查两个库的可用邮箱数量。不够时会弹窗提示，不会创建计划；够用时，加入计划的邮箱会从 available 变成 reserved。</textarea></div><div class="field full"><label>变量说明</label><textarea readonly>主题和正文都可以使用：
+{{ '{{from_mail}}' }} = 当前通道发件人邮箱
+{{ '{{to_email}}' }} = 当前收件人邮箱
+{{ '{{code8}}' }} = 每个收件人唯一 8 位数字
+
+code8 在生成计划时保存，主题和正文同步，重试不会改变。</textarea></div></div><div class="actions"><button class="btn primary">保存任务</button></div></form></div></div>
+
+<div class="modal" id="userModal"><div class="modalbox"><div class="modalhead"><div><h2>新增团队成员</h2><div class="hint">建议给普通成员使用 member 角色；只有 admin 可以管理团队成员。</div></div><button class="close" onclick="closeModal('userModal')">×</button></div><form method="post" action="/users/create"><div class="form-grid"><div class="field"><label>登录账号</label><input name="username" required placeholder="例如 zhangsan"></div><div class="field"><label>显示名称</label><input name="display_name" placeholder="例如 张三"></div><div class="field"><label>初始密码</label><input name="password" type="password" required placeholder="请输入初始密码"></div><div class="field"><label>角色</label><select name="role"><option value="member">member 普通成员</option><option value="admin">admin 管理员</option></select></div><div class="field"><label>状态</label><select name="status"><option value="active">active 启用</option><option value="disabled">disabled 停用</option></select></div></div><div class="hint">密码会使用加盐 PBKDF2 哈希保存，不会明文保存。</div><div class="actions"><button class="btn primary">保存成员</button></div></form></div></div>
+{% for u in users %}<div class="modal" id="userEdit{{u.id}}"><div class="modalbox"><div class="modalhead"><div><h2>编辑团队成员</h2><div class="hint">密码留空表示不修改原密码。</div></div><button class="close" onclick="closeModal('userEdit{{u.id}}')">×</button></div><form method="post" action="/users/{{u.id}}/update"><div class="form-grid"><div class="field"><label>登录账号</label><input value="{{u.username}}" disabled></div><div class="field"><label>显示名称</label><input name="display_name" value="{{u.display_name or ''}}"></div><div class="field"><label>新密码，可留空</label><input name="password" type="password" placeholder="留空则不修改"></div><div class="field"><label>角色</label><select name="role"><option value="member" {% if u.role=='member' %}selected{% endif %}>member 普通成员</option><option value="admin" {% if u.role=='admin' %}selected{% endif %}>admin 管理员</option></select></div><div class="field"><label>状态</label><select name="status"><option value="active" {% if u.status=='active' %}selected{% endif %}>active 启用</option><option value="disabled" {% if u.status=='disabled' %}selected{% endif %}>disabled 停用</option></select></div></div><div class="actions"><button class="btn primary">保存修改</button></div></form></div></div>{% endfor %}
+
+<script>
+function showSec(id, btn){document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));btn.classList.add('active');document.getElementById('title').innerText=btn.innerText.replace(/[📊🏷️🔑🌐👥🧩⏱️📅🧾👤]/g,'').trim();location.hash=id;const addUserBtn=document.getElementById('topAddUserBtn');if(addUserBtn)addUserBtn.style.display=(id==='users')?'inline-flex':'none'}
+function openModal(id){const m=document.getElementById(id);if(m)m.classList.add('show')}
+function closeModal(id){const m=document.getElementById(id);if(m)m.classList.remove('show')}
+function esc(v){return String(v??'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function badge(status){return '<span class="badge gray-b">'+esc(status||'-')+'</span>'}
+function normalizeProxyPreview(raw){raw=String(raw||'').trim();if(!raw)return '-';if(raw.indexOf('://')>=0)return raw.replace(/:\/\/([^:@\/]+):([^@\/]+)@/,'://***:***@');const parts=raw.split(':');if(parts.length===4){return 'http://***:***@'+parts[0]+':'+parts[1]}if(parts.length===2){return 'http://'+parts[0]+':'+parts[1]}return raw}
+function previewProxyFormat(){const i=document.getElementById('proxyUrlInput');const p=document.getElementById('proxyPreview');if(i&&p)p.innerText=normalizeProxyPreview(i.value)}
+function markSubmit(form,msg){const btn=form.querySelector('button[type=submit],button:not([type])');if(btn){btn.dataset.oldText=btn.innerText;btn.innerText=msg||'处理中...';btn.disabled=true}return true}
+async function getJson(url){const r=await fetch(url,{credentials:'same-origin'});if(!r.ok)throw new Error('请求失败：HTTP '+r.status);return await r.json()}
+function setLoading(boxId,msg){document.getElementById(boxId).innerHTML='<div class="detail-summary">'+esc(msg||'加载中...')+'</div>'}
+function renderEmpty(boxId,msg){document.getElementById(boxId).innerHTML='<div class="hint">'+esc(msg||'暂无明细')+'</div>'}
+
+
+function n(v){const x=Number(v||0);return isFinite(x)?x.toLocaleString():'0'}
+function safeBadge(v, cls){return '<span class="badge '+(cls||'gray-b')+'">'+esc(v||'-')+'</span>'}
+function miniMetric(title,value,sub){return '<div class="card metric"><div class="muted">'+esc(title)+'</div><div class="num">'+n(value)+'</div>'+(sub?'<div class="hint">'+esc(sub)+'</div>':'')+'</div>'}
+function miniTable(title, hint, headers, rows, rowFn){
+  let html='<div class="card"><div class="toolbar"><div><strong>'+esc(title)+'</strong>'+(hint?'<div class="hint">'+esc(hint)+'</div>':'')+'</div><span class="badge info-b">'+n(rows.length)+' 项</span></div>';
+  if(!rows.length){return html+'<div class="hint">暂无数据</div></div>'}
+  html+='<div class="table-wrap"><table><thead><tr>';
+  headers.forEach(h=>{html+='<th>'+esc(h)+'</th>'});
+  html+='</tr></thead><tbody>';
+  rows.forEach(r=>{html+='<tr>';rowFn(r).forEach(c=>{html+='<td>'+c+'</td>'});html+='</tr>'});
+  html+='</tbody></table></div></div>';
+  return html;
+}
+async function openTagDetails(btn){
+  const tagId=btn.dataset.tagId;
+  const tagName=btn.dataset.tagName||'标签';
+  document.getElementById('tagDetailTitle').innerText='标签细节：'+tagName;
+  document.getElementById('tagDetailSub').innerText='正在读取该标签下的整体内容...';
+  document.getElementById('tagDetailBody').innerHTML='<div class="detail-summary">正在加载标签、通道、收件人池、模板、任务、计划和日志汇总...</div>';
+  openModal('tagDetailModal');
+  try{
+    const data=await getJson('/api/tags/'+encodeURIComponent(tagId)+'/detail');
+    const d=data.detail||{};
+    const t=d.tag||{};
+    const c=d.counters||{};
+    document.getElementById('tagDetailTitle').innerText='标签细节：'+(t.name||tagName);
+    document.getElementById('tagDetailSub').innerText='类型：'+(t.service_type||'-')+'；状态：'+(t.status||'-')+'；创建时间：'+(t.created_at||'-');
+    let html='';
+    html+='<div class="detail-summary"><b>基础信息</b><br>ID：'+esc(t.id||'')+'；名称：'+esc(t.name||'')+'；类型：'+esc(t.service_type||'')+'；状态：'+esc(t.status||'')+'<br>备注：'+esc(t.remark||'-')+'</div>';
+    html+='<div class="grid g4">';
+    html+=miniMetric('通道',c.channels_total,'启用 '+n(c.channels_active));
+    html+=miniMetric('收件人池',c.pool_total,'可用 '+n(c.pool_available)+'；占用 '+n(c.pool_reserved));
+    html+=miniMetric('HTML模板',c.template_groups_total,'文件 '+n(c.template_files_total));
+    html+=miniMetric('任务',c.tasks_total,'运行中 '+n(c.tasks_running));
+    html+=miniMetric('发送计划',c.scheduled_total,'待发 '+n(c.scheduled_pending)+'；已发 '+n(c.scheduled_sent)+'；失败 '+n(c.scheduled_failed));
+    html+=miniMetric('发送日志',c.logs_total,'成功 '+n(c.logs_sent)+'；失败 '+n(c.logs_failed));
+    html+='</div>';
+    html+=miniTable('收件人池/库','按库类型展示库存状态。',['库类型','可用','已占用','已发送','失败','总数','最近导入'],d.pools||[],r=>[
+      '<b>'+esc(r.pool_name||r.pool_type)+'</b><br><span class="small">'+esc(r.pool_type||'')+'</span>',
+      safeBadge(n(r.available_count),'active-b'),safeBadge(n(r.reserved_count),'gray-b'),n(r.sent_count),n(r.failed_count),n(r.total_count),esc(r.last_import_at||'-')
+    ]);
+    html+=miniTable('API通道 / 账号','该标签下所有发信账号和代理绑定情况。',['通道','From','代理','今日/限额','计划','状态'],d.channels||[],r=>[
+      '<b>'+esc(r.name)+'</b><br><span class="small">ID '+esc(r.id)+'</span>',
+      esc(r.from_email||'')+(r.from_name?'<br><span class="small">'+esc(r.from_name)+'</span>':''),
+      esc(r.proxy_name||'无')+(r.proxy_status?'<br><span class="small">'+esc(r.proxy_status)+'</span>':''),
+      n(r.today_sent)+' / '+n(r.daily_limit),
+      '总 '+n(r.scheduled_count)+'；待 '+n(r.pending_count)+'；已 '+n(r.sent_count)+'；失败 '+n(r.failed_count),
+      safeBadge(r.status, r.status==='active'?'active-b':'gray-b')
+    ]);
+    html+=miniTable('HTML模板组','展示模板组和组内文件名。',['模板组','文件数','文件名','状态','更新时间'],d.template_groups||[],r=>[
+      '<b>'+esc(r.name)+'</b><br><span class="small">ID '+esc(r.id)+'</span>',n(r.file_count),esc(r.filenames||'-'),safeBadge(r.status,r.status==='active'?'active-b':'gray-b'),esc(r.updated_at||r.created_at||'-')
+    ]);
+    html+=miniTable('任务','该标签下的任务及其计划统计。',['任务','通道/模板','计划范围','计划','状态'],d.tasks||[],r=>[
+      '<b>'+esc(r.name)+'</b><br><span class="small">'+esc(r.subject_template||'')+'</span>',
+      esc(r.channel_name||'-')+(r.from_email?'<br><span class="small">'+esc(r.from_email)+'</span>':'')+'<br><span class="small">模板：'+esc(r.template_group_name||'-')+'</span>',
+      esc(r.first_scheduled_at||'-')+'<br><span class="small">至 '+esc(r.last_scheduled_at||'-')+'</span>',
+      '总 '+n(r.scheduled_count)+'；待 '+n(r.pending_count)+'；已 '+n(r.sent_count)+'；失败 '+n(r.failed_count),
+      safeBadge(r.status,r.status==='running'?'active-b':'gray-b')
+    ]);
+    html+=miniTable('发送计划按日期汇总','只显示日期汇总，不加载单封邮件明细，避免卡顿。',['日期','总数','待发','已发','失败'],d.schedule_by_date||[],r=>[
+      esc(r.date||'-'),n(r.total_count),n(r.pending_count),n(r.sent_count),n(r.failed_count)
+    ]);
+    html+=miniTable('发送日志按日期汇总','展示最近有日志的日期汇总。',['日期','总数','成功','失败'],d.logs_by_date||[],r=>[
+      esc(r.date||'-'),n(r.total_count),n(r.sent_count),n(r.failed_count)
+    ]);
+    document.getElementById('tagDetailBody').innerHTML=html;
+  }catch(e){
+    document.getElementById('tagDetailSub').innerText='加载失败';
+    document.getElementById('tagDetailBody').innerHTML='<div class="detail-summary">'+esc(e.message||'加载失败，请查看启动窗口错误信息。')+'</div>';
+  }
+}
+
+async function openScheduleDetails(btn){
+  const d=btn.dataset;
+  document.getElementById('scheduleDetailTitle').innerText=d.title||'发送计划细节';
+  document.getElementById('scheduleDetailSub').innerText=d.subtitle||'按日期标签加载明细。';
+  document.getElementById('scheduleDateTabs').innerHTML='';
+  setLoading('scheduleRowsBox','正在加载日期标签...');
+  openModal('scheduleDetailModal');
+  try{
+    const p=new URLSearchParams({tag_id:d.tagId,task_id:d.taskId,channel_id:d.channelId,from_email:d.fromEmail});
+    const data=await getJson('/api/schedule/detail/dates?'+p.toString());
+    const dates=data.dates||[];
+    document.getElementById('scheduleDetailSummary').innerText='选择日期标签后，只加载当天明细，避免一次性加载全部计划造成卡顿。';
+    if(!dates.length){renderEmpty('scheduleRowsBox','暂无明细');return}
+    const tabs=document.getElementById('scheduleDateTabs');
+    dates.forEach((x,i)=>{
+      const b=document.createElement('button');
+      b.type='button';b.className='date-tab'+(i===0?' active':'');
+      b.innerHTML=esc(x.date)+' <span class="small">'+esc(x.total_count)+'</span>';
+      b.onclick=function(){tabs.querySelectorAll('.date-tab').forEach(t=>t.classList.remove('active'));b.classList.add('active');loadScheduleRows(d,x.date)};
+      tabs.appendChild(b);
+    });
+    loadScheduleRows(d,dates[0].date);
+  }catch(e){document.getElementById('scheduleDetailSummary').innerText=e.message;renderEmpty('scheduleRowsBox','加载失败，请查看启动窗口错误信息。')}
+}
+async function loadScheduleRows(d,dateValue){
+  setLoading('scheduleRowsBox','正在加载 '+dateValue+' 的计划明细...');
+  try{
+    const p=new URLSearchParams({tag_id:d.tagId,task_id:d.taskId,channel_id:d.channelId,from_email:d.fromEmail,date:dateValue});
+    const data=await getJson('/api/schedule/detail/rows?'+p.toString());
+    const rows=data.rows||[];
+    if(!rows.length){renderEmpty('scheduleRowsBox','该日期暂无明细');return}
+    let html='<table><thead><tr><th>时间</th><th>邮箱</th><th>From</th><th>主题</th><th>code8</th><th>HTML</th><th>状态</th><th>错误</th></tr></thead><tbody>';
+    rows.forEach(s=>{html+='<tr><td>'+esc(s.scheduled_at)+'</td><td>'+esc(s.recipient_email)+'</td><td>'+esc(s.from_email)+'</td><td>'+esc(s.subject_rendered)+'</td><td><span class="code">'+esc(s.code8)+'</span></td><td>'+esc(s.html_file)+'</td><td>'+badge(s.status)+'</td><td>'+esc(s.last_error||'')+'</td></tr>'});
+    html+='</tbody></table>';
+    document.getElementById('scheduleRowsBox').innerHTML=html;
+  }catch(e){renderEmpty('scheduleRowsBox',e.message)}
+}
+
+async function openLogDetails(btn){
+  const d=btn.dataset;
+  document.getElementById('logDetailTitle').innerText=d.title||'发送日志细节';
+  document.getElementById('logDetailSub').innerText=d.subtitle||'按日期标签加载明细。';
+  document.getElementById('logDateTabs').innerHTML='';
+  setLoading('logRowsBox','正在加载日期标签...');
+  openModal('logDetailModal');
+  try{
+    const p=new URLSearchParams({task_id:d.taskId||'',channel_id:d.channelId||''});
+    const data=await getJson('/api/logs/detail/dates?'+p.toString());
+    const dates=data.dates||[];
+    document.getElementById('logDetailSummary').innerText='选择日期标签后，只加载当天发送日志。';
+    if(!dates.length){renderEmpty('logRowsBox','暂无发送日志');return}
+    const tabs=document.getElementById('logDateTabs');
+    dates.forEach((x,i)=>{
+      const b=document.createElement('button');
+      b.type='button';b.className='date-tab'+(i===0?' active':'');
+      b.innerHTML=esc(x.date)+' <span class="small">'+esc(x.total_count)+'</span>';
+      b.onclick=function(){tabs.querySelectorAll('.date-tab').forEach(t=>t.classList.remove('active'));b.classList.add('active');loadLogRows(d,x.date)};
+      tabs.appendChild(b);
+    });
+    loadLogRows(d,dates[0].date);
+  }catch(e){document.getElementById('logDetailSummary').innerText=e.message;renderEmpty('logRowsBox','加载失败，请查看启动窗口错误信息。')}
+}
+async function loadLogRows(d,dateValue){
+  setLoading('logRowsBox','正在加载 '+dateValue+' 的发送日志...');
+  try{
+    const p=new URLSearchParams({task_id:d.taskId||'',channel_id:d.channelId||'',date:dateValue});
+    const data=await getJson('/api/logs/detail/rows?'+p.toString());
+    const rows=data.rows||[];
+    if(!rows.length){renderEmpty('logRowsBox','该日期暂无发送日志');return}
+    let html='<table><thead><tr><th>时间</th><th>邮箱</th><th>通道</th><th>代理</th><th>主题</th><th>HTTP</th><th>Message ID</th><th>状态</th><th>错误</th></tr></thead><tbody>';
+    rows.forEach(l=>{html+='<tr><td>'+esc(l.created_at)+'</td><td>'+esc(l.recipient_email)+'</td><td>'+esc(l.channel_name)+'</td><td>'+esc(l.proxy_name||'-')+'</td><td>'+esc(l.subject||'')+'</td><td>'+esc(l.http_status||'-')+'</td><td><span class="code">'+esc(l.sendgrid_message_id||'-')+'</span></td><td>'+badge(l.status)+'</td><td>'+esc(l.error_message||'')+'</td></tr>'});
+    html+='</tbody></table>';
+    document.getElementById('logRowsBox').innerHTML=html;
+  }catch(e){renderEmpty('logRowsBox',e.message)}
+}
+
+document.querySelectorAll('.modal').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('show')}));
+window.addEventListener('load',()=>{let h=location.hash.replace('#','');if(h){let b=[...document.querySelectorAll('.nav button')].find(x=>x.getAttribute('onclick')&&x.getAttribute('onclick').includes("'"+h+"'"));if(b)showSec(h,b)}});
+
+document.querySelectorAll('form').forEach(f=>{
+  f.addEventListener('submit',e=>{
+    const btn=e.submitter||f.querySelector('button');
+    if(btn){btn.dataset.oldText=btn.innerText;btn.innerText='处理中...';btn.disabled=true;}
+  });
+});
+</script>
+</body></html>

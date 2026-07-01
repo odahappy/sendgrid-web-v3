@@ -1,0 +1,17 @@
+[Unit]
+Description=SendGrid Web Admin Scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__APP_DIR__/.venv/bin/uvicorn app.main:app --host __HOST__ --port __PORT__ --proxy-headers --forwarded-allow-ips=*
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

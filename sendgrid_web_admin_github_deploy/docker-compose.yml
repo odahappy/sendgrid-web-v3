@@ -1,0 +1,13 @@
+services:
+  sendgrid-web-admin:
+    build: .
+    container_name: sendgrid-web-admin
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs

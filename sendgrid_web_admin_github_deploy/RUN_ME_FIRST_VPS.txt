@@ -1,0 +1,13 @@
+VPS运行最快方式：
+
+1. 上传整个 sendgrid_web_admin_vps 文件夹到 Ubuntu VPS
+2. 进入目录：
+   cd sendgrid_web_admin_vps
+3. 执行安装：
+   bash scripts/install_ubuntu_vps.sh
+4. 看到随机密码后，打开：
+   http://你的VPS公网IP:8080
+5. 查看日志：
+   sudo journalctl -u sendgrid-web-admin -f
+
+详细说明见 README_VPS.md

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+
+# Runtime data
+.env
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+uploads/templates/*
+!uploads/templates/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Build artifacts
+*.zip
+*.tar.gz
