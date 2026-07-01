@@ -37,30 +37,39 @@ cd "$APP_DIR"
 
 if [ ! -f .env ]; then
   cp .env.vps.example .env
+
   ADMIN_PASSWORD="$(python3 - <<'PY'
-import secrets, string
+import secrets
+import string
+
 alphabet = string.ascii_letters + string.digits
 print(''.join(secrets.choice(alphabet) for _ in range(16)))
 PY
 )"
+
   SECRET_KEY="$(python3 - <<'PY'
 import secrets
 print(secrets.token_urlsafe(48))
 PY
 )"
+
   SERVICE_TOKEN="$(python3 - <<'PY'
 import secrets
 print(secrets.token_urlsafe(40))
 PY
 )"
+
   sed -i "s|ADMIN_PASSWORD=CHANGE_THIS_ADMIN_PASSWORD|ADMIN_PASSWORD=${ADMIN_PASSWORD}|" .env
   sed -i "s|SECRET_KEY=CHANGE_THIS_LONG_RANDOM_SECRET_KEY|SECRET_KEY=${SECRET_KEY}|" .env
   sed -i "s|SERVICE_TOKEN=CHANGE_THIS_LONG_RANDOM_SERVICE_TOKEN|SERVICE_TOKEN=${SERVICE_TOKEN}|" .env
+
   echo "Generated .env with random production secrets."
   echo "Initial admin login: admin / ${ADMIN_PASSWORD}"
 else
   echo ".env already exists, keeping existing configuration."
 fi
+
+ADMIN_PASSWORD_PRINT="$(grep '^ADMIN_PASSWORD=' "$APP_DIR/.env" | cut -d= -f2- || true)"
 
 echo "Creating Python virtual environment..."
 python3 -m venv .venv
@@ -69,6 +78,7 @@ python3 -m venv .venv
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 echo "Creating systemd service: ${SERVICE_FILE}"
+
 sed \
   -e "s|__SERVICE_USER__|${SERVICE_USER}|g" \
   -e "s|__SERVICE_GROUP__|${SERVICE_GROUP}|g" \
@@ -86,10 +96,12 @@ if command -v ufw >/dev/null 2>&1; then
 fi
 
 sleep 2
+
 sudo systemctl --no-pager --full status "$SERVICE_NAME" || true
 
 PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
+
 if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
   HEALTH_STATUS="OK"
 else
@@ -100,6 +112,8 @@ echo ""
 echo "============================================================"
 echo "Installed successfully."
 echo "Access URL: http://${PUBLIC_IP}:${PORT}"
+echo "ADMIN_PASSWORD=${ADMIN_PASSWORD_PRINT}"
+echo ""
 echo "Health check: ${HEALTH_STATUS}"
 echo "Service: ${SERVICE_NAME}"
 echo "Check logs: sudo journalctl -u ${SERVICE_NAME} -f"
