@@ -19,6 +19,22 @@
   <div class="grid g4"><div class="card metric"><div class="muted">已计划</div><div class="num">{{ stats.total_scheduled }}</div></div><div class="card metric"><div class="muted">已发送任务</div><div class="num">{{ stats.total_sent }}</div></div><div class="card metric"><div class="muted">待发送任务</div><div class="num">{{ stats.total_pending }}</div></div><div class="card metric"><div class="muted">启用通道</div><div class="num">{{ stats.active_channels }}</div></div><div class="card metric"><div class="muted">团队成员</div><div class="num">{{ stats.active_users }}</div></div></div>
   <div class="card"><div class="toolbar"><div><strong>SendGrid 统计概览</strong><div class="hint">到达、打开、点击、拒绝、投诉需要配置 SendGrid Event Webhook 后才会增长。</div></div><span class="badge info-b">类似 SendGrid 首页统计</span></div><div class="grid g6"><div class="card metric"><div class="muted">发送数量</div><div class="num">{{ sg_metrics.sent }}</div></div><div class="card metric"><div class="muted">到达数量</div><div class="num">{{ sg_metrics.delivered }}</div></div><div class="card metric"><div class="muted">打开数量</div><div class="num">{{ sg_metrics.opened }}</div></div><div class="card metric"><div class="muted">点击数量</div><div class="num">{{ sg_metrics.clicked }}</div></div><div class="card metric"><div class="muted">拒绝数量</div><div class="num">{{ sg_metrics.rejected }}</div></div><div class="card metric"><div class="muted">投诉数量</div><div class="num">{{ sg_metrics.complaints }}</div></div></div></div>
   <div class="card"><div class="toolbar"><strong>变量规则</strong><span class="badge info-b">主题与正文同步</span></div><div class="varbox"><div class="var"><b>{{ '{{from_mail}}' }}</b><div class="hint">发件人邮箱，来自当前通道绑定的 From Email。</div></div><div class="var"><b>{{ '{{to_email}}' }}</b><div class="hint">收件人邮箱，来自列表。</div></div><div class="var"><b>{{ '{{code8}}' }}</b><div class="hint">生成计划时保存的 8 位数字，主题和正文一致，重试不变。</div></div></div></div>
+  <div style="
+    margin: 80px auto 0;
+    width: 420px;
+    max-width: 90%;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 16px 20px;
+    text-align: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    color: #111827;
+    font-size: 16px;
+    font-weight: 600;
+  ">
+    有新的想法可以联系TG：<span style="color:#2563eb;">@mesen8899</span>
+  </div>
 </section>
 
 <section id="tags" class="section"><div class="card"><div class="toolbar"><div><strong>标签 / 项目</strong><div class="hint">点击“查看细节”可查看该标签下绑定的通道、代理、收件人池、HTML模板、任务、发送计划和发送日志汇总。</div></div><button class="btn primary" onclick="openModal('tagModal')">新建标签</button></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>名称</th><th>类型</th><th>状态</th><th>备注</th><th>创建时间</th><th>操作</th></tr></thead><tbody>{% for x in tags %}<tr><td>{{x.id}}</td><td><b>{{x.name}}</b></td><td><span class="badge info-b">{{x.service_type}}</span></td><td>{{x.status}}</td><td>{{x.remark or ''}}</td><td>{{x.created_at or '-'}}</td><td><button type="button" class="btn primary" data-tag-id="{{x.id}}" data-tag-name="{{x.name}}" onclick="openTagDetails(this)">查看细节</button></td></tr>{% endfor %}</tbody></table></div></div></section>
