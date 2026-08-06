@@ -10,6 +10,27 @@ curl -fsSL https://raw.githubusercontent.com/你的GitHub用户名/sendgrid-web-
 
 详细说明见 `GITHUB_DEPLOY.md` 和 `OPTIMIZATION_NOTES.md`。
 
+
+## GitHub 一条命令安装应用和 HTTPS
+
+在 Ubuntu VPS 上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/odahappy/sendgrid-web-v3/main/sendgrid_web_admin_github_deploy/scripts/install_all.sh | sudo env DOMAIN=mailops.example.com EMAIL=admin@example.com APP_PORT=9000 bash
+```
+
+安装器会自动等待 Ubuntu 的 `apt/dpkg` 锁，默认最多等待 900 秒，并在软件包安装失败时自动修复未完成的 `dpkg` 配置后重试 5 次。不要手工删除 `/var/lib/dpkg/lock-frontend`。
+
+可选参数：
+
+```text
+APT_LOCK_TIMEOUT=900   # 等待 apt 锁的最长秒数
+APT_RETRIES=5          # apt-get 最大尝试次数
+APT_RETRY_DELAY=10     # 每次重试前等待秒数
+```
+
+重复运行安装命令会保留 `/opt/sendgrid-web-admin/.env`、数据库、上传文件和日志。
+
 ---
 
 # SendGrid Web Admin Scheduler - VPS 运行版

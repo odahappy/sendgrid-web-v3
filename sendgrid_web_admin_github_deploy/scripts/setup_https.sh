@@ -7,20 +7,104 @@ APP_PORT="${APP_PORT:-9000}"
 APP_DIR="${APP_DIR:-/opt/sendgrid-web-admin}"
 NGINX_CONF_NAME="${NGINX_CONF_NAME:-sendgrid-web-admin}"
 SERVICE_NAME="${SERVICE_NAME:-sendgrid-web-admin}"
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-900}"
+APT_RETRIES="${APT_RETRIES:-5}"
+APT_RETRY_DELAY="${APT_RETRY_DELAY:-10}"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: This script must run as root."
+  echo "Example:"
+  echo "curl -fsSL https://raw.githubusercontent.com/odahappy/sendgrid-web-v3/main/sendgrid_web_admin_github_deploy/scripts/setup_https.sh | sudo env DOMAIN=mailops.example.com EMAIL=admin@example.com APP_PORT=9000 bash"
+  exit 1
+fi
 
 if [ -z "$DOMAIN" ]; then
   echo "ERROR: DOMAIN is required."
-  echo "Example:"
-  echo "curl -fsSL https://raw.githubusercontent.com/odahappy/sendgrid-web-v3/main/sendgrid_web_admin_github_deploy/scripts/setup_https.sh | sudo env DOMAIN=mailops.example.com EMAIL=admin@example.com APP_PORT=9000 bash"
   exit 1
 fi
 
 if [ -z "$EMAIL" ]; then
   echo "ERROR: EMAIL is required."
-  echo "Example:"
-  echo "curl -fsSL https://raw.githubusercontent.com/odahappy/sendgrid-web-v3/main/sendgrid_web_admin_github_deploy/scripts/setup_https.sh | sudo env DOMAIN=mailops.example.com EMAIL=admin@example.com APP_PORT=9000 bash"
   exit 1
 fi
+
+apt_is_busy() {
+  local lock_file
+
+  if command -v fuser >/dev/null 2>&1; then
+    for lock_file in \
+      /var/lib/dpkg/lock-frontend \
+      /var/lib/dpkg/lock \
+      /var/cache/apt/archives/lock \
+      /var/lib/apt/lists/lock; do
+      if [ -e "$lock_file" ] && fuser "$lock_file" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
+  fi
+
+  pgrep -x apt >/dev/null 2>&1 \
+    || pgrep -x apt-get >/dev/null 2>&1 \
+    || pgrep -x dpkg >/dev/null 2>&1 \
+    || pgrep -f '/usr/bin/unattended-upgrade' >/dev/null 2>&1 \
+    || pgrep -f 'unattended-upgr' >/dev/null 2>&1
+}
+
+wait_for_apt() {
+  local started_at now elapsed
+  started_at="$(date +%s)"
+
+  while apt_is_busy; do
+    now="$(date +%s)"
+    elapsed=$((now - started_at))
+
+    if [ "$elapsed" -ge "$APT_LOCK_TIMEOUT" ]; then
+      echo "ERROR: apt/dpkg remained busy for ${APT_LOCK_TIMEOUT} seconds."
+      ps -ef | grep -E '[a]pt|[d]pkg|[u]nattended' || true
+      return 1
+    fi
+
+    echo "apt/dpkg is busy, waiting... (${elapsed}s/${APT_LOCK_TIMEOUT}s)"
+    sleep 5
+  done
+}
+
+repair_dpkg() {
+  wait_for_apt
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+}
+
+apt_retry() {
+  local attempt=1
+  local rc=0
+
+  while [ "$attempt" -le "$APT_RETRIES" ]; do
+    wait_for_apt
+    echo "Running apt-get $* (attempt ${attempt}/${APT_RETRIES})..."
+
+    if DEBIAN_FRONTEND=noninteractive apt-get \
+      -o DPkg::Lock::Timeout=120 \
+      -o Acquire::Retries=3 \
+      "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+
+    echo "WARNING: apt-get failed with exit code ${rc}."
+    repair_dpkg
+
+    if [ "$attempt" -lt "$APT_RETRIES" ]; then
+      echo "Retrying in ${APT_RETRY_DELAY} seconds..."
+      sleep "$APT_RETRY_DELAY"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "ERROR: apt-get $* failed after ${APT_RETRIES} attempts."
+  return "$rc"
+}
 
 echo "============================================================"
 echo "Setting up HTTPS for SendGrid Web Admin"
@@ -28,6 +112,7 @@ echo "Domain: ${DOMAIN}"
 echo "Email: ${EMAIL}"
 echo "App port: ${APP_PORT}"
 echo "App dir: ${APP_DIR}"
+echo "Apt lock timeout: ${APT_LOCK_TIMEOUT}s"
 echo "============================================================"
 
 echo "Checking port usage..."
@@ -47,8 +132,8 @@ if ss -tulpn | grep -E ":443 " | grep -v nginx >/dev/null 2>&1; then
 fi
 
 echo "Installing Nginx and Certbot..."
-apt-get update
-apt-get install -y nginx certbot python3-certbot-nginx curl ca-certificates
+apt_retry update
+apt_retry install -y nginx certbot python3-certbot-nginx curl ca-certificates psmisc
 
 echo "Checking local app service..."
 if curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/api/health" >/dev/null 2>&1; then
@@ -63,7 +148,7 @@ echo "Creating Nginx reverse proxy config..."
 
 mkdir -p /var/www/html
 
-cat > "/etc/nginx/sites-available/${NGINX_CONF_NAME}" <<EOF
+cat > "/etc/nginx/sites-available/${NGINX_CONF_NAME}" <<EOF_NGINX
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -90,7 +175,7 @@ server {
         proxy_read_timeout 300;
     }
 }
-EOF
+EOF_NGINX
 
 ln -sf "/etc/nginx/sites-available/${NGINX_CONF_NAME}" "/etc/nginx/sites-enabled/${NGINX_CONF_NAME}"
 rm -f /etc/nginx/sites-enabled/default

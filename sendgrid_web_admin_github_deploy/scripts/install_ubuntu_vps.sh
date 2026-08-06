@@ -8,22 +8,107 @@ SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
 HOST="${SERVER_HOST:-127.0.0.1}"
 EXPOSE_APP_PORT="${EXPOSE_APP_PORT:-false}"
 PORT="${SERVER_PORT:-8080}"
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-900}"
+APT_RETRIES="${APT_RETRIES:-5}"
+APT_RETRY_DELAY="${APT_RETRY_DELAY:-10}"
 
-if ! command -v sudo >/dev/null 2>&1; then
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=()
+elif command -v sudo >/dev/null 2>&1; then
+  SUDO=(sudo)
+else
   echo "sudo is required on Ubuntu VPS."
   exit 1
 fi
+
+apt_is_busy() {
+  local lock_file
+
+  if command -v fuser >/dev/null 2>&1; then
+    for lock_file in \
+      /var/lib/dpkg/lock-frontend \
+      /var/lib/dpkg/lock \
+      /var/cache/apt/archives/lock \
+      /var/lib/apt/lists/lock; do
+      if [ -e "$lock_file" ] && fuser "$lock_file" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
+  fi
+
+  pgrep -x apt >/dev/null 2>&1 \
+    || pgrep -x apt-get >/dev/null 2>&1 \
+    || pgrep -x dpkg >/dev/null 2>&1 \
+    || pgrep -f '/usr/bin/unattended-upgrade' >/dev/null 2>&1 \
+    || pgrep -f 'unattended-upgr' >/dev/null 2>&1
+}
+
+wait_for_apt() {
+  local started_at now elapsed
+  started_at="$(date +%s)"
+
+  while apt_is_busy; do
+    now="$(date +%s)"
+    elapsed=$((now - started_at))
+
+    if [ "$elapsed" -ge "$APT_LOCK_TIMEOUT" ]; then
+      echo "ERROR: apt/dpkg remained busy for ${APT_LOCK_TIMEOUT} seconds."
+      ps -ef | grep -E '[a]pt|[d]pkg|[u]nattended' || true
+      return 1
+    fi
+
+    echo "apt/dpkg is busy, waiting... (${elapsed}s/${APT_LOCK_TIMEOUT}s)"
+    sleep 5
+  done
+}
+
+repair_dpkg() {
+  wait_for_apt
+  DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" dpkg --configure -a || true
+}
+
+apt_retry() {
+  local attempt=1
+  local rc=0
+
+  while [ "$attempt" -le "$APT_RETRIES" ]; do
+    wait_for_apt
+    echo "Running apt-get $* (attempt ${attempt}/${APT_RETRIES})..."
+
+    if DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get \
+      -o DPkg::Lock::Timeout=120 \
+      -o Acquire::Retries=3 \
+      "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+
+    echo "WARNING: apt-get failed with exit code ${rc}."
+    repair_dpkg
+
+    if [ "$attempt" -lt "$APT_RETRIES" ]; then
+      echo "Retrying in ${APT_RETRY_DELAY} seconds..."
+      sleep "$APT_RETRY_DELAY"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "ERROR: apt-get $* failed after ${APT_RETRIES} attempts."
+  return "$rc"
+}
 
 cd "$(dirname "$0")/.."
 SRC_DIR="$(pwd)"
 
 echo "Installing OS packages..."
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip rsync curl ca-certificates
+apt_retry update
+apt_retry install -y python3 python3-venv python3-pip rsync curl ca-certificates psmisc
 
 echo "Copying project to ${APP_DIR} ..."
-sudo mkdir -p "$APP_DIR"
-sudo rsync -a --delete \
+"${SUDO[@]}" mkdir -p "$APP_DIR"
+"${SUDO[@]}" rsync -a --delete \
   --exclude '.venv' \
   --exclude 'data' \
   --exclude 'uploads' \
@@ -31,8 +116,8 @@ sudo rsync -a --delete \
   --exclude '.git' \
   "$SRC_DIR"/ "$APP_DIR"/
 
-sudo mkdir -p "$APP_DIR/data" "$APP_DIR/uploads/templates" "$APP_DIR/logs"
-sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"
+"${SUDO[@]}" mkdir -p "$APP_DIR/data" "$APP_DIR/uploads/templates" "$APP_DIR/logs"
+"${SUDO[@]}" chown -R "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"
 
 cd "$APP_DIR"
 
@@ -93,19 +178,19 @@ sed \
   -e "s|__APP_DIR__|${APP_DIR}|g" \
   -e "s|__HOST__|${HOST}|g" \
   -e "s|__PORT__|${PORT}|g" \
-  deploy/systemd/sendgrid-web-admin.service.template | sudo tee "$SERVICE_FILE" >/dev/null
+  deploy/systemd/sendgrid-web-admin.service.template | "${SUDO[@]}" tee "$SERVICE_FILE" >/dev/null
 
-sudo systemctl daemon-reload
-sudo systemctl enable "$SERVICE_NAME"
-sudo systemctl restart "$SERVICE_NAME"
+"${SUDO[@]}" systemctl daemon-reload
+"${SUDO[@]}" systemctl enable "$SERVICE_NAME"
+"${SUDO[@]}" systemctl restart "$SERVICE_NAME"
 
 if command -v ufw >/dev/null 2>&1 && [ "${EXPOSE_APP_PORT}" = "true" ]; then
-  sudo ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+  "${SUDO[@]}" ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
 fi
 
 sleep 2
 
-sudo systemctl --no-pager --full status "$SERVICE_NAME" || true
+"${SUDO[@]}" systemctl --no-pager --full status "$SERVICE_NAME" || true
 
 PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
