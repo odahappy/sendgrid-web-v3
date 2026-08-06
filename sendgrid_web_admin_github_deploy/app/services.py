@@ -2,7 +2,10 @@ import json
 import random
 import os
 import hashlib
+import hmac
 import shutil
+import sqlite3
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -13,7 +16,7 @@ import requests
 from .config import get_settings
 from .crypto import protect, unprotect
 from .db import q_all, q_one, execute, execute_many, execute_rowcount, today, get_conn
-from .utils import now_iso, parse_recipient_line, code8, render_vars
+from .utils import now_iso, parse_recipient_line, code8, render_vars, is_valid_email
 
 
 SENDGRID_URL = "https://api.sendgrid.com/v3/mail/send"
@@ -151,20 +154,22 @@ def verify_password(password, stored_hash):
         check = hashlib.pbkdf2_hmac(
             "sha256", (password or "").encode("utf-8"), salt.encode("utf-8"), 200000
         ).hex()
-        return check == digest
+        return hmac.compare_digest(check, digest)
     except Exception:
         return False
 
 
 def authenticate_user(username, password):
     user = q_one("SELECT * FROM users WHERE username=?", ((username or "").strip(),))
-    if not user:
-        return None
-    if user.get("status") != "active":
+    if not user or user.get("status") != "active":
         return None
     if not verify_password(password, user.get("password_hash")):
         return None
     execute("UPDATE users SET last_login_at=?, updated_at=? WHERE id=?", (now_iso(), now_iso(), user["id"]))
+    return _session_user(user)
+
+
+def _session_user(user):
     return {
         "id": user["id"],
         "username": user["username"],
@@ -173,12 +178,19 @@ def authenticate_user(username, password):
     }
 
 
+def get_active_user_session(user_id):
+    user = q_one("SELECT * FROM users WHERE id=? AND status='active'", (user_id,))
+    return _session_user(user) if user else None
+
+
 def create_user(username, password, display_name, role, status):
     username = (username or "").strip()
     if not username:
         raise ValueError("username is required")
     if not password:
         raise ValueError("password is required")
+    if len(password) < 8:
+        raise ValueError("Password must contain at least 8 characters")
     role = role if role in ("admin", "member") else "member"
     status = status if status in ("active", "disabled") else "active"
     return execute("""
@@ -190,7 +202,22 @@ def create_user(username, password, display_name, role, status):
 def update_user(user_id, display_name, role, status, password=None):
     role = role if role in ("admin", "member") else "member"
     status = status if status in ("active", "disabled") else "active"
+    current = q_one("SELECT id, role, status FROM users WHERE id=?", (user_id,))
+    if not current:
+        raise ValueError("User not found")
+    removes_active_admin = (
+        current.get("role") == "admin"
+        and current.get("status") == "active"
+        and (role != "admin" or status != "active")
+    )
+    if removes_active_admin:
+        active_admins = _count("SELECT COUNT(*) AS c FROM users WHERE role='admin' AND status='active'")
+        if active_admins <= 1:
+            raise ValueError("不能停用或降级最后一个有效管理员。")
+
     if password and password.strip():
+        if len(password.strip()) < 8:
+            raise ValueError("Password must contain at least 8 characters")
         execute("""
             UPDATE users
             SET display_name=?, role=?, status=?, password_hash=?, updated_at=?
@@ -341,10 +368,12 @@ def delete_template_group(group_id):
 
 def save_template_file(group_id, filename, content_bytes):
     settings = get_settings()
-    safe_name = filename.replace("\\", "_").replace("/", "_")
+    safe_name = (filename or "template.html").replace("\\", "_").replace("/", "_")[:180]
     folder = Path(settings.template_storage_dir) / str(group_id)
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / safe_name
+    # Keep the display filename, but use a unique storage name so repeated
+    # uploads never overwrite an older template file.
+    path = folder / (uuid.uuid4().hex + "_" + safe_name)
     path.write_bytes(content_bytes)
     text = content_bytes.decode("utf-8", errors="ignore").lower()
     has_unsub = 1 if ("unsubscribe" in text or "退订" in text) else 0
@@ -537,6 +566,204 @@ def get_recipient_pool_stats():
     return result
 
 
+def get_recipient_pool_rows(tag_id, pool_type, status="", search="", page=1, page_size=50):
+    """Return a paginated, searchable recipient-pool detail view.
+
+    The dashboard only renders summary counts. This function is intentionally
+    paginated so a pool containing hundreds of thousands of recipients does
+    not freeze the browser or force SQLite to return the full table at once.
+    """
+    tag_id = int(tag_id)
+    pool_type = _normalize_pool_type(pool_type)
+    if not q_one("SELECT id FROM tags WHERE id=?", (tag_id,)):
+        raise ValueError("标签不存在")
+
+    allowed_statuses = {"available", "reserved", "sent", "failed"}
+    status = (status or "").strip().lower()
+    if status and status not in allowed_statuses:
+        raise ValueError("未知收件人状态")
+
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = min(200, max(10, int(page_size)))
+    except (TypeError, ValueError):
+        page_size = 50
+
+    conditions = ["p.tag_id=?", "p.pool_type=?"]
+    params = [tag_id, pool_type]
+    if status:
+        conditions.append("p.status=?")
+        params.append(status)
+    search = (search or "").strip()
+    if search:
+        like = "%{}%".format(search.replace("%", "\\%").replace("_", "\\_"))
+        conditions.append("(p.email LIKE ? ESCAPE '\\' OR COALESCE(p.name,'') LIKE ? ESCAPE '\\' OR COALESCE(p.source_name,'') LIKE ? ESCAPE '\\')")
+        params.extend([like, like, like])
+
+    where_sql = " AND ".join(conditions)
+    total = _count("SELECT COUNT(*) AS c FROM recipient_pool p WHERE " + where_sql, tuple(params))
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, pages)
+    offset = (page - 1) * page_size
+    rows = q_all(
+        """
+        SELECT
+            p.*,
+            t.name AS tag_name,
+            (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.recipient_pool_id=p.id) AS schedule_count,
+            (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.recipient_pool_id=p.id AND s.status IN ('pending','sending')) AS active_schedule_count
+        FROM recipient_pool p
+        JOIN tags t ON t.id=p.tag_id
+        WHERE {where_sql}
+        ORDER BY p.id DESC
+        LIMIT ? OFFSET ?
+        """.format(where_sql=where_sql),
+        tuple(params + [page_size, offset]),
+    )
+    for row in rows:
+        row["schedule_count"] = int(row.get("schedule_count") or 0)
+        row["active_schedule_count"] = int(row.get("active_schedule_count") or 0)
+        row["pool_name"] = _pool_name(row.get("pool_type"))
+        row["identity_editable"] = bool(
+            row.get("status") == "available" and row["schedule_count"] == 0
+        )
+        row["deletable"] = row["identity_editable"]
+
+    return {
+        "rows": rows,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "total": total,
+        "tag_id": tag_id,
+        "pool_type": pool_type,
+        "pool_name": _pool_name(pool_type),
+        "status": status,
+        "search": search,
+    }
+
+
+def update_recipient_pool_entry(recipient_id, tag_id, pool_type, email, name="", source_name=""):
+    """Edit one recipient without invalidating generated schedules.
+
+    Email/tag/pool identity can only change while the recipient is still
+    available and has never been copied into a schedule. Name and source notes
+    remain editable for audit corrections after use.
+    """
+    recipient_id = int(recipient_id)
+    tag_id = int(tag_id)
+    pool_type = _normalize_pool_type(pool_type)
+    email = (email or "").strip().lower()
+    name = (name or "").strip()
+    source_name = (source_name or "").strip()
+    if not is_valid_email(email):
+        raise ValueError("邮箱格式不正确")
+    if not q_one("SELECT id FROM tags WHERE id=?", (tag_id,)):
+        raise ValueError("标签不存在")
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM recipient_pool WHERE id=?", (recipient_id,)).fetchone()
+        if not row:
+            raise ValueError("收件人不存在")
+        schedule_count = int(conn.execute(
+            "SELECT COUNT(*) FROM scheduled_email_tasks WHERE recipient_pool_id=?",
+            (recipient_id,),
+        ).fetchone()[0])
+        identity_changed = (
+            int(row["tag_id"]) != tag_id
+            or row["pool_type"] != pool_type
+            or (row["email"] or "").lower() != email
+        )
+        if identity_changed and (row["status"] != "available" or schedule_count > 0):
+            raise ValueError("该收件人已进入发送流程，只能修改姓名和来源备注")
+        try:
+            conn.execute(
+                """
+                UPDATE recipient_pool
+                SET tag_id=?, pool_type=?, email=?, name=?, source_name=?, updated_at=?
+                WHERE id=?
+                """,
+                (tag_id, pool_type, email, name, source_name, now_iso(), recipient_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("目标标签和库中已存在该邮箱") from exc
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"ok": True, "id": recipient_id}
+
+
+def delete_recipient_pool_entry(recipient_id):
+    """Physically delete one unused recipient.
+
+    Used recipients are retained so schedules, send logs, and audit history do
+    not point at a removed pool record.
+    """
+    recipient_id = int(recipient_id)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT id, email, status FROM recipient_pool WHERE id=?", (recipient_id,)).fetchone()
+        if not row:
+            raise ValueError("收件人不存在")
+        schedule_count = int(conn.execute(
+            "SELECT COUNT(*) FROM scheduled_email_tasks WHERE recipient_pool_id=?",
+            (recipient_id,),
+        ).fetchone()[0])
+        if row["status"] != "available" or schedule_count > 0:
+            raise ValueError("该收件人已被任务使用，不能删除；可保留用于发送记录审计")
+        deleted = conn.execute(
+            "DELETE FROM recipient_pool WHERE id=? AND status='available'",
+            (recipient_id,),
+        ).rowcount
+        if deleted != 1:
+            raise ValueError("收件人状态已变化，请刷新后重试")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"ok": True, "id": recipient_id, "email": row["email"]}
+
+
+def delete_available_recipient_pool(tag_id, pool_type):
+    """Delete all currently unused recipients in one tag/pool group."""
+    tag_id = int(tag_id)
+    pool_type = _normalize_pool_type(pool_type)
+    if not q_one("SELECT id FROM tags WHERE id=?", (tag_id,)):
+        raise ValueError("标签不存在")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        deleted = conn.execute(
+            """
+            DELETE FROM recipient_pool
+            WHERE tag_id=? AND pool_type=? AND status='available'
+              AND NOT EXISTS (
+                SELECT 1 FROM scheduled_email_tasks s
+                WHERE s.recipient_pool_id=recipient_pool.id
+              )
+            """,
+            (tag_id, pool_type),
+        ).rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"ok": True, "deleted": int(deleted or 0)}
+
+
 def _validate_task_resources(tag_id, channel_id, template_group_id):
     """Ensure channel and template group belong to the selected tag."""
     tag_id = int(tag_id)
@@ -655,139 +882,47 @@ def _check_pool_stock_or_raise(tag_id, need_by_type):
 
 
 def _release_pool_reservations_for_task(task_id):
-    """Release unsent reservations before deleting/regenerating a task.
+    """Release a task's non-sending reservations atomically.
 
-    Pending/sending emails go back to available. Sent emails stay sent. Final failed
-    emails stay failed and are not returned automatically.
+    Active sending rows are deliberately excluded; callers must reject deletion or
+    regeneration while a send is in flight.
     """
-    execute("""
-        UPDATE recipient_pool
-        SET status='available', reserved_task_id=NULL, reserved_schedule_id=NULL,
-            reserved_at=NULL, updated_at=?
-        WHERE id IN (
-            SELECT recipient_pool_id FROM scheduled_email_tasks
-            WHERE task_id=? AND status IN ('pending', 'sending') AND recipient_pool_id IS NOT NULL
-        )
-    """, (now_iso(), task_id))
-    execute("""
-        UPDATE recipient_pool
-        SET status='failed', updated_at=?
-        WHERE id IN (
-            SELECT recipient_pool_id FROM scheduled_email_tasks
-            WHERE task_id=? AND status='failed' AND recipient_pool_id IS NOT NULL
-        )
-    """, (now_iso(), task_id))
-    execute("""
-        UPDATE recipient_pool
-        SET status='sent', sent_at=COALESCE(sent_at, ?), updated_at=?
-        WHERE id IN (
-            SELECT recipient_pool_id FROM scheduled_email_tasks
-            WHERE task_id=? AND status='sent' AND recipient_pool_id IS NOT NULL
-        )
-    """, (now_iso(), now_iso(), task_id))
-
-
-def generate_plan(task_id, force=False):
-    task = q_one("SELECT * FROM mail_tasks WHERE id=?", (task_id,))
-    if not task:
-        raise ValueError("Task not found")
-
-    existing = int(q_one("SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=?", (task_id,))["c"])
-    if existing and not force:
-        return {"ok": False, "message": "Plan already exists. Use force to recreate.", "existing": existing}
-
-    sent_existing = int(q_one(
-        "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status='sent'",
-        (task_id,),
-    )["c"])
-    if force and sent_existing > 0:
-        raise ValueError("该任务已经有已发送记录，不能直接重生成。请新建任务，避免重复发送。")
-
-    channel = q_one("SELECT * FROM send_channels WHERE id=?", (task["channel_id"],))
-    if not channel:
-        raise ValueError("Channel not found")
-
-    templates = q_all("SELECT * FROM template_files WHERE group_id=?", (task["template_group_id"],))
-    if not templates:
-        raise ValueError("No template files in selected group")
-
-    if force:
-        _release_pool_reservations_for_task(task_id)
-        execute("DELETE FROM scheduled_email_tasks WHERE task_id=? AND status IN ('pending', 'sending', 'failed')", (task_id,))
-
-    now = datetime.now()
-    limit_by_day = _build_30_day_warmup_limits()
-    need_by_type = _pool_need_by_type(limit_by_day)
-    _check_pool_stock_or_raise(task["tag_id"], need_by_type)
-
-    # Pull recipients from the two available pools only after all stock checks pass.
-    selected = []
-    selected_by_pool = {}
-    for pool_type, need in need_by_type.items():
-        rows = q_all("""
-            SELECT id, email, name, pool_type
-            FROM recipient_pool
-            WHERE tag_id=? AND pool_type=? AND status='available'
-            ORDER BY id ASC
-            LIMIT ?
-        """, (task["tag_id"], pool_type, int(need)))
-        if len(rows) < int(need):
-            raise ValueError("{} 可用邮箱不足。".format(_pool_name(pool_type)))
-        selected_by_pool[pool_type] = rows
-
-    for day_offset in range(30):
-        pool_type = POOL_0_3 if day_offset <= 2 else POOL_4_30
-        day_recipients = selected_by_pool[pool_type][:limit_by_day[day_offset]]
-        selected_by_pool[pool_type] = selected_by_pool[pool_type][limit_by_day[day_offset]:]
-        for rec in day_recipients:
-            selected.append((day_offset, rec))
-
     conn = get_conn()
     try:
-        cur = conn.cursor()
-        rows = []
-        for day_offset, rec in selected:
-            day_start, day_end = _day_window(now, day_offset)
-            tfile = random.choice(templates)
-            c8 = code8()
-            variables = {
-                "from_mail": channel["from_email"],
-                "to_email": rec["email"],
-                "code8": c8,
-            }
-            subject_rendered = render_vars(task["subject_template"], variables)
-            scheduled_at = _random_time(day_start, day_end).isoformat(timespec="seconds")
-            row = (
-                task["id"], task["tag_id"], task["channel_id"],
-                rec["email"], rec.get("name") or "",
-                channel["from_email"], channel.get("from_name") or "",
-                task["subject_template"], subject_rendered,
-                tfile["file_path"], c8, scheduled_at,
-                "pending", 0, now_iso(), rec["id"], rec["pool_type"]
+        conn.execute("BEGIN IMMEDIATE")
+        sending = conn.execute(
+            "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status='sending'",
+            (task_id,),
+        ).fetchone()["c"]
+        if sending:
+            raise ValueError("任务仍有邮件正在发送，请稍后再重试。")
+        stamp = now_iso()
+        conn.execute("""
+            UPDATE recipient_pool
+            SET status='available', reserved_task_id=NULL, reserved_schedule_id=NULL,
+                reserved_at=NULL, updated_at=?
+            WHERE id IN (
+                SELECT recipient_pool_id FROM scheduled_email_tasks
+                WHERE task_id=? AND status='pending' AND recipient_pool_id IS NOT NULL
             )
-            rows.append(row)
-
-        cur.executemany("""
-            INSERT INTO scheduled_email_tasks (
-                task_id, tag_id, channel_id, recipient_email, recipient_name,
-                from_email, from_name, subject_template, subject_rendered,
-                html_file, code8, scheduled_at, status, attempts, created_at,
-                recipient_pool_id, recipient_pool_type
+        """, (stamp, task_id))
+        conn.execute("""
+            UPDATE recipient_pool
+            SET status='failed', reserved_task_id=NULL, reserved_schedule_id=NULL, updated_at=?
+            WHERE id IN (
+                SELECT recipient_pool_id FROM scheduled_email_tasks
+                WHERE task_id=? AND status='failed' AND recipient_pool_id IS NOT NULL
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-
-        # Mark the selected pool records as reserved. They disappear from the available pool.
-        pool_ids = [rec["id"] for _, rec in selected]
-        if pool_ids:
-            placeholders = ",".join("?" for _ in pool_ids)
-            cur.execute("""
-                UPDATE recipient_pool
-                SET status='reserved', reserved_task_id=?, reserved_at=?, updated_at=?
-                WHERE id IN ({}) AND status='available'
-            """.format(placeholders), (task_id, now_iso(), now_iso(), *pool_ids))
-
-        cur.execute("UPDATE mail_tasks SET status='planned', updated_at=? WHERE id=?", (now_iso(), task_id))
+        """, (stamp, task_id))
+        conn.execute("""
+            UPDATE recipient_pool
+            SET status='sent', reserved_task_id=NULL, reserved_schedule_id=NULL,
+                sent_at=COALESCE(sent_at, ?), updated_at=?
+            WHERE id IN (
+                SELECT recipient_pool_id FROM scheduled_email_tasks
+                WHERE task_id=? AND status='sent' AND recipient_pool_id IS NOT NULL
+            )
+        """, (stamp, stamp, task_id))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -795,13 +930,219 @@ def generate_plan(task_id, force=False):
     finally:
         conn.close()
 
-    return {
-        "ok": True,
-        "created": len(rows),
-        "need_0_3": need_by_type[POOL_0_3],
-        "need_4_30": need_by_type[POOL_4_30],
-        "daily_limits": limit_by_day,
-    }
+
+def generate_plan(task_id, force=False):
+    """Create a capacity-aware 30-day plan in one SQLite write transaction."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        task_row = cur.execute("SELECT * FROM mail_tasks WHERE id=?", (task_id,)).fetchone()
+        if not task_row:
+            raise ValueError("Task not found")
+        task = dict(task_row)
+
+        status_counts = {
+            row["status"]: int(row["c"])
+            for row in cur.execute(
+                "SELECT status, COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? GROUP BY status",
+                (task_id,),
+            ).fetchall()
+        }
+        existing = sum(status_counts.values())
+        if existing and not force:
+            conn.rollback()
+            return {"ok": False, "message": "Plan already exists. Use force to recreate.", "existing": existing}
+        if force and status_counts.get("sent", 0) > 0:
+            raise ValueError("该任务已经有已发送记录，不能直接重生成。请新建任务，避免重复发送。")
+        if force and status_counts.get("sending", 0) > 0:
+            raise ValueError("该任务仍有邮件正在发送，不能重生成。请稍后再试。")
+
+        channel_row = cur.execute("SELECT * FROM send_channels WHERE id=?", (task["channel_id"],)).fetchone()
+        if not channel_row:
+            raise ValueError("Channel not found")
+        channel = dict(channel_row)
+        if channel.get("status") != "active":
+            raise ValueError("Channel is not active")
+
+        templates = [dict(row) for row in cur.execute(
+            "SELECT * FROM template_files WHERE group_id=? ORDER BY id",
+            (task["template_group_id"],),
+        ).fetchall()]
+        if not templates:
+            raise ValueError("No template files in selected group")
+
+        now = datetime.now()
+        if now.hour >= 22:
+            plan_start = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+        else:
+            plan_start = now
+
+        requested_limits = _build_30_day_warmup_limits()
+        daily_limit = max(1, int(channel.get("daily_limit") or 1))
+        params = [task["channel_id"]]
+        exclude_current = ""
+        if force:
+            exclude_current = " AND task_id<>?"
+            params.append(task_id)
+        occupied_rows = cur.execute("""
+            SELECT substr(scheduled_at, 1, 10) AS day_key, COUNT(*) AS c
+            FROM scheduled_email_tasks
+            WHERE channel_id=?
+              AND status IN ('pending', 'sending', 'sent')
+              {} 
+            GROUP BY substr(scheduled_at, 1, 10)
+        """.format(exclude_current), tuple(params)).fetchall()
+        occupied = {row["day_key"]: int(row["c"]) for row in occupied_rows}
+        stat_rows = cur.execute("""
+            SELECT date AS day_key, sent_count + reserved_count AS c
+            FROM channel_daily_stats
+            WHERE channel_id=?
+        """, (task["channel_id"],)).fetchall()
+        for row in stat_rows:
+            # Sent scheduled rows normally appear in both sources. MAX avoids
+            # double counting while still covering logs whose task was deleted.
+            occupied[row["day_key"]] = max(occupied.get(row["day_key"], 0), int(row["c"] or 0))
+
+        limit_by_day = {}
+        for day_offset in range(30):
+            day_start, _ = _day_window(plan_start, day_offset)
+            remaining = max(0, daily_limit - occupied.get(day_start.date().isoformat(), 0))
+            limit_by_day[day_offset] = min(int(requested_limits[day_offset]), remaining)
+        if sum(limit_by_day.values()) <= 0:
+            raise ValueError("未来 30 天该通道没有可用发送容量，请提高日限额或选择其他通道。")
+
+        need_by_type = _pool_need_by_type(limit_by_day)
+        selected = []
+        selected_emails = set()
+        selected_by_pool = {}
+        for pool_type in (POOL_0_3, POOL_4_30):
+            need = int(need_by_type[pool_type])
+            if need <= 0:
+                selected_by_pool[pool_type] = []
+                continue
+            # Cross-pool duplicates can consume at most one extra row per email
+            # already selected, so this bounded over-fetch is sufficient.
+            fetch_limit = need + len(selected_emails)
+            candidates = cur.execute("""
+                SELECT id, email, name, pool_type
+                FROM (
+                    SELECT id, email, name, pool_type,
+                           CASE WHEN reserved_task_id=? THEN 0 ELSE 1 END AS own_priority,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY lower(trim(email))
+                               ORDER BY CASE WHEN reserved_task_id=? THEN 0 ELSE 1 END, id ASC
+                           ) AS email_rank
+                    FROM recipient_pool
+                    WHERE tag_id=? AND pool_type=?
+                      AND (status='available' OR (reserved_task_id=? AND status IN ('reserved', 'failed')))
+                )
+                WHERE email_rank=1
+                ORDER BY own_priority, id ASC
+                LIMIT ?
+            """, (task_id, task_id, task["tag_id"], pool_type, task_id, fetch_limit)).fetchall()
+            chosen = []
+            for row in candidates:
+                item = dict(row)
+                normalized = (item.get("email") or "").strip().lower()
+                if not normalized or normalized in selected_emails:
+                    continue
+                selected_emails.add(normalized)
+                chosen.append(item)
+                if len(chosen) >= need:
+                    break
+            if len(chosen) < need:
+                raise ValueError("{} 可用且去重后的邮箱不足：需要 {}，实际 {}。".format(
+                    _pool_name(pool_type), need, len(chosen)
+                ))
+            selected_by_pool[pool_type] = chosen
+
+        for day_offset in range(30):
+            pool_type = POOL_0_3 if day_offset <= 2 else POOL_4_30
+            count = int(limit_by_day[day_offset])
+            day_recipients = selected_by_pool[pool_type][:count]
+            selected_by_pool[pool_type] = selected_by_pool[pool_type][count:]
+            selected.extend((day_offset, rec) for rec in day_recipients)
+
+        rows = []
+        stamp = now_iso()
+        for day_offset, rec in selected:
+            day_start, day_end = _day_window(plan_start, day_offset)
+            tfile = random.choice(templates)
+            c8 = code8()
+            variables = {
+                "from_mail": channel["from_email"],
+                "to_email": rec["email"],
+                "code8": c8,
+            }
+            rows.append((
+                task["id"], task["tag_id"], task["channel_id"],
+                rec["email"], rec.get("name") or "",
+                channel["from_email"], channel.get("from_name") or "",
+                task["subject_template"], render_vars(task["subject_template"], variables),
+                tfile["file_path"], c8,
+                _random_time(day_start, day_end).isoformat(timespec="seconds"),
+                "pending", 0, stamp, rec["id"], rec["pool_type"], None, None,
+            ))
+
+        # Destructive replacement starts only after every validation and allocation
+        # succeeded. Any later exception rolls the original plan back intact.
+        if force:
+            cur.execute("""
+                UPDATE recipient_pool
+                SET status='available', reserved_task_id=NULL, reserved_schedule_id=NULL,
+                    reserved_at=NULL, updated_at=?
+                WHERE reserved_task_id=? AND status IN ('reserved', 'failed')
+            """, (stamp, task_id))
+            cur.execute(
+                "DELETE FROM scheduled_email_tasks WHERE task_id=? AND status IN ('pending', 'failed')",
+                (task_id,),
+            )
+
+        pool_ids = [rec["id"] for _, rec in selected]
+        reserved = 0
+        for offset in range(0, len(pool_ids), 500):
+            chunk = pool_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cur.execute("""
+                UPDATE recipient_pool
+                SET status='reserved', reserved_task_id=?, reserved_schedule_id=NULL,
+                    reserved_at=?, updated_at=?
+                WHERE id IN ({})
+                  AND (status='available' OR reserved_task_id=?)
+            """.format(placeholders), (task_id, stamp, stamp, *chunk, task_id))
+            reserved += cur.rowcount
+        if reserved != len(pool_ids):
+            raise RuntimeError("Recipient reservation conflict: expected {}, reserved {}".format(len(pool_ids), reserved))
+
+        cur.executemany("""
+            INSERT INTO scheduled_email_tasks (
+                task_id, tag_id, channel_id, recipient_email, recipient_name,
+                from_email, from_name, subject_template, subject_rendered,
+                html_file, code8, scheduled_at, status, attempts, created_at,
+                recipient_pool_id, recipient_pool_type, claimed_at, worker_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        cur.execute("UPDATE mail_tasks SET status='planned', updated_at=? WHERE id=?", (stamp, task_id))
+        conn.commit()
+
+        return {
+            "ok": True,
+            "created": len(rows),
+            "need_0_3": need_by_type[POOL_0_3],
+            "need_4_30": need_by_type[POOL_4_30],
+            "daily_limits": limit_by_day,
+            "requested_daily_limits": requested_limits,
+            "channel_daily_limit": daily_limit,
+            "capacity_capped": any(limit_by_day[d] < requested_limits[d] for d in range(30)),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 def start_task(task_id):
     execute("UPDATE mail_tasks SET status='running', updated_at=? WHERE id=?", (now_iso(), task_id))
@@ -816,10 +1157,54 @@ def resume_task(task_id):
 
 
 def delete_mail_task(task_id):
-    _release_pool_reservations_for_task(task_id)
-    execute("DELETE FROM scheduled_email_tasks WHERE task_id=?", (task_id,))
-    execute("DELETE FROM mail_task_recipient_lists WHERE task_id=?", (task_id,))
-    return execute_rowcount("DELETE FROM mail_tasks WHERE id=?", (task_id,))
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        sending = cur.execute(
+            "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status='sending'",
+            (task_id,),
+        ).fetchone()["c"]
+        if sending:
+            raise ValueError("任务仍有邮件正在发送，请稍后再删除。")
+        stamp = now_iso()
+        cur.execute("""
+            UPDATE recipient_pool
+            SET status='available', reserved_task_id=NULL, reserved_schedule_id=NULL,
+                reserved_at=NULL, updated_at=?
+            WHERE id IN (
+                SELECT recipient_pool_id FROM scheduled_email_tasks
+                WHERE task_id=? AND status='pending' AND recipient_pool_id IS NOT NULL
+            )
+        """, (stamp, task_id))
+        cur.execute("""
+            UPDATE recipient_pool
+            SET status='failed', reserved_task_id=NULL, reserved_schedule_id=NULL, updated_at=?
+            WHERE id IN (
+                SELECT recipient_pool_id FROM scheduled_email_tasks
+                WHERE task_id=? AND status='failed' AND recipient_pool_id IS NOT NULL
+            )
+        """, (stamp, task_id))
+        cur.execute("""
+            UPDATE recipient_pool
+            SET status='sent', reserved_task_id=NULL, reserved_schedule_id=NULL,
+                sent_at=COALESCE(sent_at, ?), updated_at=?
+            WHERE id IN (
+                SELECT recipient_pool_id FROM scheduled_email_tasks
+                WHERE task_id=? AND status='sent' AND recipient_pool_id IS NOT NULL
+            )
+        """, (stamp, stamp, task_id))
+        cur.execute("DELETE FROM scheduled_email_tasks WHERE task_id=?", (task_id,))
+        cur.execute("DELETE FROM mail_task_recipient_lists WHERE task_id=?", (task_id,))
+        cur.execute("DELETE FROM mail_tasks WHERE id=?", (task_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _count(sql, params=()):
@@ -1302,25 +1687,98 @@ def channel_daily_sent(channel_id):
     return int(row["sent_count"]) if row else 0
 
 
+def _reserve_channel_slot(channel_id, daily_limit, scheduled_id, worker_id):
+    """Atomically reserve daily capacity and attach it to the claimed message."""
+    slot_date = today()
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR IGNORE INTO channel_daily_stats
+                (channel_id, date, sent_count, failed_count, reserved_count, last_error)
+            VALUES (?, ?, 0, 0, 0, NULL)
+        """, (channel_id, slot_date))
+        cur.execute("""
+            UPDATE channel_daily_stats
+            SET reserved_count=reserved_count + 1
+            WHERE channel_id=? AND date=?
+              AND sent_count + reserved_count < ?
+        """, (channel_id, slot_date, max(1, int(daily_limit))))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return None
+        cur.execute("""
+            UPDATE scheduled_email_tasks
+            SET channel_slot_date=?
+            WHERE id=? AND status='sending' AND worker_id=?
+        """, (slot_date, scheduled_id, worker_id))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        return slot_date
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _complete_channel_slot(channel_id, slot_date, sent_ok, error=None):
+    if not slot_date:
+        return
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if sent_ok:
+            conn.execute("""
+                UPDATE channel_daily_stats
+                SET reserved_count=MAX(0, reserved_count - 1), sent_count=sent_count + 1
+                WHERE channel_id=? AND date=?
+            """, (channel_id, slot_date))
+        else:
+            conn.execute("""
+                UPDATE channel_daily_stats
+                SET reserved_count=MAX(0, reserved_count - 1),
+                    failed_count=failed_count + 1, last_error=?
+                WHERE channel_id=? AND date=?
+            """, (error, channel_id, slot_date))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def increment_channel_stat(channel_id, sent_ok, error=None):
-    row = q_one("SELECT id FROM channel_daily_stats WHERE channel_id=? AND date=?", (channel_id, today()))
-    if not row:
-        execute("""
-            INSERT INTO channel_daily_stats (channel_id, date, sent_count, failed_count, last_error)
-            VALUES (?, ?, 0, 0, NULL)
+    """Backward-compatible wrapper for callers outside the worker path."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            INSERT OR IGNORE INTO channel_daily_stats
+                (channel_id, date, sent_count, failed_count, reserved_count, last_error)
+            VALUES (?, ?, 0, 0, 0, NULL)
         """, (channel_id, today()))
-    if sent_ok:
-        execute("""
-            UPDATE channel_daily_stats
-            SET sent_count = sent_count + 1
-            WHERE channel_id=? AND date=?
-        """, (channel_id, today()))
-    else:
-        execute("""
-            UPDATE channel_daily_stats
-            SET failed_count = failed_count + 1, last_error=?
-            WHERE channel_id=? AND date=?
-        """, (error, channel_id, today()))
+        if sent_ok:
+            conn.execute("""
+                UPDATE channel_daily_stats SET sent_count=sent_count + 1
+                WHERE channel_id=? AND date=?
+            """, (channel_id, today()))
+        else:
+            conn.execute("""
+                UPDATE channel_daily_stats
+                SET failed_count=failed_count + 1, last_error=?
+                WHERE channel_id=? AND date=?
+            """, (error, channel_id, today()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _build_proxies(channel):
@@ -1360,10 +1818,6 @@ def _send_via_sendgrid(scheduled):
         if channel["status"] != "active":
             return False, None, "Channel is not active", None
 
-        sent_today = channel_daily_sent(channel["id"])
-        if sent_today >= int(channel["daily_limit"]):
-            return False, None, "Channel daily limit reached", None
-
         html = Path(scheduled["html_file"]).read_text(encoding="utf-8", errors="ignore")
         variables = {
             "from_mail": scheduled["from_email"],
@@ -1380,18 +1834,16 @@ def _send_via_sendgrid(scheduled):
                 return False, None, "Marketing HTML does not contain unsubscribe keyword/link", None
 
         payload = {
-            "personalizations": [
-                {
-                    "to": [{"email": scheduled["recipient_email"]}],
-                    "custom_args": {
-                        "source": "web_admin_scheduler",
-                        "scheduled_task_id": str(scheduled["id"]),
-                        "task_id": str(scheduled["task_id"]),
-                        "channel_id": str(channel["id"]),
-                        "code8": scheduled["code8"],
-                    }
-                }
-            ],
+            "personalizations": [{
+                "to": [{"email": scheduled["recipient_email"]}],
+                "custom_args": {
+                    "source": "web_admin_scheduler",
+                    "scheduled_task_id": str(scheduled["id"]),
+                    "task_id": str(scheduled["task_id"]),
+                    "channel_id": str(channel["id"]),
+                    "code8": scheduled["code8"],
+                },
+            }],
             "from": {
                 "email": scheduled["from_email"],
                 "name": scheduled["from_name"] or channel.get("from_name") or "",
@@ -1399,12 +1851,10 @@ def _send_via_sendgrid(scheduled):
             "subject": subject_rendered,
             "content": [{"type": "text/html", "value": html_rendered}],
         }
-
         headers = {
             "Authorization": "Bearer {}".format(unprotect(channel["api_key_protected"])),
             "Content-Type": "application/json",
         }
-
         resp = requests.post(
             SENDGRID_URL,
             headers=headers,
@@ -1415,24 +1865,69 @@ def _send_via_sendgrid(scheduled):
         msg_id = resp.headers.get("X-Message-Id") or resp.headers.get("x-message-id")
         ok = resp.status_code in (200, 202)
         err = None if ok else resp.text
+        request_log = json.dumps(payload, ensure_ascii=False) if settings.store_send_request_body else None
         _log_send_attempt(
             scheduled, channel, subject_rendered, resp.status_code, msg_id,
-            "sent" if ok else "failed", err,
-            json.dumps(payload, ensure_ascii=False), resp.text
+            "sent" if ok else "failed", err, request_log, (resp.text or "")[:10000],
         )
-        increment_channel_stat(channel["id"], ok, err)
         return ok, msg_id, err, resp.text
     except Exception as exc:
         error = str(exc)
         _log_send_attempt(
-            scheduled, channel, scheduled["subject_rendered"], None, None,
-            "failed", error, None, None
+            scheduled, channel, scheduled.get("subject_rendered") or "", None, None,
+            "failed", error, None, None,
         )
-        increment_channel_stat(channel["id"], False, error)
         return False, None, error, None
 
 
+def _next_day_retry_at():
+    return (datetime.now() + timedelta(days=1)).replace(
+        hour=8, minute=5, second=0, microsecond=0
+    ).isoformat(timespec="seconds")
+
+
+def _recover_stale_sending_claims():
+    settings = get_settings()
+    timeout_seconds = max(settings.worker_claim_timeout_seconds, settings.request_timeout_seconds * 2)
+    cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        stale_slots = cur.execute("""
+            SELECT channel_id, channel_slot_date, COUNT(*) AS c
+            FROM scheduled_email_tasks
+            WHERE status='sending' AND (claimed_at IS NULL OR claimed_at <= ?)
+              AND channel_slot_date IS NOT NULL
+            GROUP BY channel_id, channel_slot_date
+        """, (cutoff,)).fetchall()
+        for row in stale_slots:
+            cur.execute("""
+                UPDATE channel_daily_stats
+                SET reserved_count=MAX(0, reserved_count - ?)
+                WHERE channel_id=? AND date=?
+            """, (int(row["c"]), row["channel_id"], row["channel_slot_date"]))
+        cur.execute("""
+            UPDATE scheduled_email_tasks
+            SET status='pending', worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL,
+                last_error=CASE
+                    WHEN last_error IS NULL OR last_error='' THEN 'Recovered stale worker claim'
+                    ELSE last_error || ' | Recovered stale worker claim'
+                END
+            WHERE status='sending' AND (claimed_at IS NULL OR claimed_at <= ?)
+        """, (cutoff,))
+        recovered = cur.rowcount
+        conn.commit()
+        return recovered
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def process_due_tasks(limit):
+    _recover_stale_sending_claims()
     now_value = now_iso()
     due = q_all("""
         SELECT s.*
@@ -1443,65 +1938,80 @@ def process_due_tasks(limit):
           AND s.scheduled_at <= ?
         ORDER BY s.scheduled_at ASC, s.id ASC
         LIMIT ?
-    """, (now_value, limit))
+    """, (now_value, max(1, int(limit))))
 
     processed = 0
+    worker_id = uuid.uuid4().hex
     for task in due:
+        claimed_at = now_iso()
         claimed = execute_rowcount("""
             UPDATE scheduled_email_tasks
-            SET status='sending'
-            WHERE id=?
-              AND status='pending'
-              AND scheduled_at <= ?
+            SET status='sending', claimed_at=?, worker_id=?
+            WHERE id=? AND status='pending' AND scheduled_at <= ?
               AND EXISTS (
-                  SELECT 1
-                  FROM mail_tasks m
-                  WHERE m.id=scheduled_email_tasks.task_id
-                    AND m.status='running'
+                  SELECT 1 FROM mail_tasks m
+                  WHERE m.id=scheduled_email_tasks.task_id AND m.status='running'
               )
-        """, (task["id"], now_value))
+        """, (claimed_at, worker_id, task["id"], now_value))
         if claimed != 1:
             continue
-        ok, msg_id, err, raw = _send_via_sendgrid(task)
-        if ok:
-            sent_at = now_iso()
+
+        task = q_one("SELECT * FROM scheduled_email_tasks WHERE id=?", (task["id"],)) or task
+        channel = q_one("SELECT * FROM send_channels WHERE id=?", (task["channel_id"],))
+        slot_date = None
+        if channel and channel.get("status") == "active":
+            slot_date = _reserve_channel_slot(
+                channel["id"], channel.get("daily_limit") or 1, task["id"], worker_id
+            )
+
+        if channel and channel.get("status") == "active" and not slot_date:
             execute("""
                 UPDATE scheduled_email_tasks
-                SET status='sent', sent_at=?, sender_response=?
-                WHERE id=?
-            """, (sent_at, raw or msg_id or "", task["id"]))
-            if task.get("recipient_pool_id"):
+                SET status='pending', scheduled_at=?, last_error=?, worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL
+                WHERE id=? AND status='sending' AND worker_id=?
+            """, (_next_day_retry_at(), "Channel daily limit reached", task["id"], worker_id))
+            processed += 1
+            continue
+
+        if not channel:
+            ok, msg_id, err, raw = False, None, "Channel not found", None
+        elif channel.get("status") != "active":
+            ok, msg_id, err, raw = False, None, "Channel is not active", None
+        else:
+            ok, msg_id, err, raw = _send_via_sendgrid(task)
+
+        if slot_date:
+            _complete_channel_slot(channel["id"], slot_date, ok, err)
+
+        if ok:
+            sent_at = now_iso()
+            updated = execute_rowcount("""
+                UPDATE scheduled_email_tasks
+                SET status='sent', sent_at=?, sender_response=?, worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL
+                WHERE id=? AND status='sending' AND worker_id=?
+            """, (sent_at, raw or msg_id or "", task["id"], worker_id))
+            if updated == 1 and task.get("recipient_pool_id"):
                 execute("""
                     UPDATE recipient_pool
                     SET status='sent', sent_at=?, updated_at=?
-                    WHERE id=?
-                """, (sent_at, sent_at, task["recipient_pool_id"]))
+                    WHERE id=? AND reserved_task_id=?
+                """, (sent_at, sent_at, task["recipient_pool_id"], task["task_id"]))
         else:
-            if err == "Channel daily limit reached":
-                retry_at = (datetime.now() + timedelta(days=1)).replace(hour=8, minute=5, second=0, microsecond=0).isoformat(timespec="seconds")
+            attempts = int(task.get("attempts") or 0) + 1
+            status = "failed" if attempts >= 3 else "pending"
+            retry_at = (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")
+            updated = execute_rowcount("""
+                UPDATE scheduled_email_tasks
+                SET status=?, attempts=?, scheduled_at=?, last_error=?, sender_response=?,
+                    worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL
+                WHERE id=? AND status='sending' AND worker_id=?
+            """, (status, attempts, retry_at, err, raw, task["id"], worker_id))
+            if updated == 1 and status == "failed" and task.get("recipient_pool_id"):
                 execute("""
-                    UPDATE scheduled_email_tasks
-                    SET status='pending', scheduled_at=?, last_error=?, sender_response=?
-                    WHERE id=?
-                """, (retry_at, err, raw, task["id"]))
-            else:
-                attempts = int(task["attempts"]) + 1
-                if attempts >= 3:
-                    status = "failed"
-                else:
-                    status = "pending"
-                retry_at = (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")
-                execute("""
-                    UPDATE scheduled_email_tasks
-                    SET status=?, attempts=?, scheduled_at=?, last_error=?, sender_response=?
-                    WHERE id=?
-                """, (status, attempts, retry_at, err, raw, task["id"]))
-                if status == "failed" and task.get("recipient_pool_id"):
-                    execute("""
-                        UPDATE recipient_pool
-                        SET status='failed', updated_at=?
-                        WHERE id=?
-                    """, (now_iso(), task["recipient_pool_id"]))
+                    UPDATE recipient_pool
+                    SET status='failed', updated_at=?
+                    WHERE id=? AND reserved_task_id=?
+                """, (now_iso(), task["recipient_pool_id"], task["task_id"]))
         processed += 1
     return processed
 
@@ -1514,26 +2024,41 @@ def record_sendgrid_events(payload):
     else:
         events = []
 
-    rows = []
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        rows.append((
-            ev.get("email"),
-            ev.get("event") or ev.get("event_type") or "unknown",
-            str(ev.get("timestamp") or ""),
-            ev.get("sg_message_id") or ev.get("sg_message-id") or ev.get("sendgrid_message_id"),
-            ev.get("smtp-id") or ev.get("smtp_id"),
-            ev.get("reason") or ev.get("response") or ev.get("status"),
-            json.dumps(ev, ensure_ascii=False),
-            now_iso(),
-        ))
-    if rows:
-        execute_many("""
-            INSERT INTO sendgrid_events (
+    conn = get_conn()
+    inserted = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            email = ev.get("email")
+            event_type = ev.get("event") or ev.get("event_type") or "unknown"
+            timestamp_value = str(ev.get("timestamp") or "")
+            sg_message_id = ev.get("sg_message_id") or ev.get("sg_message-id") or ev.get("sendgrid_message_id")
+            smtp_id = ev.get("smtp-id") or ev.get("smtp_id")
+            reason = ev.get("reason") or ev.get("response") or ev.get("status")
+            raw_json = json.dumps(ev, ensure_ascii=False, sort_keys=True)
+            provider_event_id = ev.get("sg_event_id") or ev.get("event_id")
+            # Signed Event Webhook payloads normally include sg_event_id.
+            # For older payloads, hashing canonical raw JSON deduplicates exact
+            # retries without collapsing distinct events that share a timestamp.
+            identity = str(provider_event_id or raw_json)
+            event_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            cur.execute("""
+                INSERT OR IGNORE INTO sendgrid_events (
+                    email, event_type, timestamp_value, sg_message_id, smtp_id,
+                    reason, raw_json, event_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
                 email, event_type, timestamp_value, sg_message_id, smtp_id,
-                reason, raw_json, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-    return len(rows)
+                reason, raw_json, event_key, now_iso(),
+            ))
+            inserted += max(0, cur.rowcount)
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

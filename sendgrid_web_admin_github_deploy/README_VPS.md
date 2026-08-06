@@ -6,13 +6,9 @@
 curl -fsSL https://raw.githubusercontent.com/你的GitHub用户名/sendgrid-web-admin/main/scripts/onekey_install.sh | sudo env GITHUB_REPO=你的GitHub用户名/sendgrid-web-admin bash
 ```
 
-安装完成后，终端会直接输出访问地址，例如：
+安装脚本默认只监听 `127.0.0.1`，避免后台端口直接暴露。推荐使用 `scripts/install_all.sh` 一次完成应用和 HTTPS 安装。
 
-```text
-http://你的VPS公网IP:8080
-```
-
-详细说明见 `GITHUB_DEPLOY.md`。
+详细说明见 `GITHUB_DEPLOY.md` 和 `OPTIMIZATION_NOTES.md`。
 
 ---
 
@@ -43,23 +39,14 @@ bash scripts/install_ubuntu_vps.sh
 - 创建 `.venv`
 - 安装 requirements
 - 自动生成 `.env`
-- 自动生成随机后台密码、SECRET_KEY、SERVICE_TOKEN
+- 自动生成随机后台密码、独立的 SECRET_KEY、DATA_ENCRYPTION_KEY、SERVICE_TOKEN
 - 创建 systemd 服务
 - 开机自启
 - 启动服务
 
-安装完成后会显示：
+安装完成后会显示随机管理员密码。默认后台只监听本机，请继续运行 HTTPS 安装脚本，或使用 `scripts/install_all.sh`。
 
-```text
-Initial admin login: admin / 随机密码
-Access URL: http://YOUR_VPS_IP:8080
-```
-
-访问：
-
-```text
-http://你的VPS公网IP:8080
-```
+确实需要临时公开应用端口时，显式设置 `SERVER_HOST=0.0.0.0 EXPOSE_APP_PORT=true`；不建议长期这样运行。
 
 ---
 
@@ -209,10 +196,10 @@ sudo systemctl restart sendgrid-web-admin
 Nginx 配置里已经设置：
 
 ```nginx
-client_max_body_size 0;
+client_max_body_size 50m;
 ```
 
-所以收件人池/库上传不会被 Nginx 文件大小限制拦住。
+该上限覆盖默认多文件上传场景，同时避免无限请求体耗尽内存。
 
 ---
 
@@ -258,5 +245,6 @@ sudo ufw reload
 
 1. **不要启动多个 worker**。本项目后台发送线程在应用进程内运行，多进程会有重复发送风险。
 2. **不要随意修改 SECRET_KEY**。它用于保护数据库里的 API Key 和代理地址，修改后旧数据可能无法正确解密。
-3. **收件人池上传已解除应用层大小限制**。如果走 Nginx，也要保证 `client_max_body_size 0`。
-4. **SQLite 适合单机 VPS**。如果后续多台服务器同时运行，建议再升级数据库和任务锁机制。
+3. **收件人池上传有安全限制**。通过 `MAX_RECIPIENT_UPLOAD_BYTES` 和 `MAX_RECIPIENT_FILES_PER_UPLOAD` 调整；Nginx 示例上限为 50 MB。
+4. **SECRET_KEY 与 DATA_ENCRYPTION_KEY 必须分离**。前者签名 Session，后者使用 AES-GCM 保护 API Key 和代理密码。
+5. **SQLite 适合单机 VPS**。计划生成和容量预留已做原子事务，但仍建议保持单应用进程。

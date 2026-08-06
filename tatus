@@ -1,0 +1,37 @@
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/.env.example', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/.env.vps.example', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/README.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/README_VPS.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/RUN_ME_FIRST.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/config.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/crypto.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/db.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/services.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/templates/admin.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/app/worker.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/deploy/nginx/sendgrid-web-admin.conf', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/requirements.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/scripts/backup_sqlite.sh', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/scripts/install_ubuntu_vps.sh', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'sendgrid_web_admin_github_deploy/start_vps.sh', LF will be replaced by CRLF the next time Git touches it
+ sendgrid_web_admin_github_deploy/.env.example      |  22 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/.env.vps.example  |  26 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/README.txt        |  24 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/README_VPS.md     |  32 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/RUN_ME_FIRST.txt  |   5 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/app/config.py     |  60 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/app/crypto.py     |  34 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/app/db.py         |  32 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/app/main.py       | 257 [32m+++++[m[31m-[m
+ sendgrid_web_admin_github_deploy/app/services.py   | 977 [32m++++++++++++++++[m[31m-----[m
+ .../app/templates/admin.html                       |  99 [32m++[m[31m-[m
+ sendgrid_web_admin_github_deploy/app/worker.py     |  42 [32m+[m[31m-[m
+ .../deploy/nginx/sendgrid-web-admin.conf           |   4 [32m+[m[31m-[m
+ .../docker-compose.yml                             |   2 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/requirements.txt  |   1 [32m+[m
+ .../scripts/backup_sqlite.sh                       |  16 [32m+[m[31m-[m
+ .../scripts/install_ubuntu_vps.sh                  |  34 [32m+[m[31m-[m
+ sendgrid_web_admin_github_deploy/start_vps.sh      |   2 [32m+[m[31m-[m
+ 18 files changed, 1326 insertions(+), 343 deletions(-)
