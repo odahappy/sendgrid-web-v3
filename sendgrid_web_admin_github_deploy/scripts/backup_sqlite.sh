@@ -20,7 +20,21 @@ fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="$BACKUP_DIR/web_admin_scheduler_${TS}.db"
-cp "$DB_PATH" "$OUT"
+
+# SQLite's backup API produces a transactionally consistent copy even in WAL mode.
+python3 - "$DB_PATH" "$OUT" <<'PY'
+import sqlite3
+import sys
+
+source_path, destination_path = sys.argv[1], sys.argv[2]
+source = sqlite3.connect(source_path, timeout=30)
+destination = sqlite3.connect(destination_path)
+try:
+    source.backup(destination)
+finally:
+    destination.close()
+    source.close()
+PY
 
 tar -czf "$BACKUP_DIR/uploads_${TS}.tar.gz" uploads 2>/dev/null || true
 

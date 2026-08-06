@@ -5,7 +5,8 @@ APP_DIR="${APP_DIR:-/opt/sendgrid-web-admin}"
 SERVICE_NAME="${SERVICE_NAME:-sendgrid-web-admin}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
 SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
-HOST="${SERVER_HOST:-0.0.0.0}"
+HOST="${SERVER_HOST:-127.0.0.1}"
+EXPOSE_APP_PORT="${EXPOSE_APP_PORT:-false}"
 PORT="${SERVER_PORT:-8080}"
 
 if ! command -v sudo >/dev/null 2>&1; then
@@ -53,6 +54,12 @@ print(secrets.token_urlsafe(48))
 PY
 )"
 
+  DATA_ENCRYPTION_KEY="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+)"
+
   SERVICE_TOKEN="$(python3 - <<'PY'
 import secrets
 print(secrets.token_urlsafe(40))
@@ -61,6 +68,7 @@ PY
 
   sed -i "s|ADMIN_PASSWORD=CHANGE_THIS_ADMIN_PASSWORD|ADMIN_PASSWORD=${ADMIN_PASSWORD}|" .env
   sed -i "s|SECRET_KEY=CHANGE_THIS_LONG_RANDOM_SECRET_KEY|SECRET_KEY=${SECRET_KEY}|" .env
+  sed -i "s|DATA_ENCRYPTION_KEY=CHANGE_THIS_LONG_RANDOM_DATA_KEY|DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY}|" .env
   sed -i "s|SERVICE_TOKEN=CHANGE_THIS_LONG_RANDOM_SERVICE_TOKEN|SERVICE_TOKEN=${SERVICE_TOKEN}|" .env
 
   echo "Generated .env with random production secrets."
@@ -91,7 +99,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl restart "$SERVICE_NAME"
 
-if command -v ufw >/dev/null 2>&1; then
+if command -v ufw >/dev/null 2>&1 && [ "${EXPOSE_APP_PORT}" = "true" ]; then
   sudo ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
 fi
 
@@ -111,7 +119,11 @@ fi
 echo ""
 echo "============================================================"
 echo "Installed successfully."
-echo "Access URL: http://${PUBLIC_IP}:${PORT}"
+if [ "${HOST}" = "127.0.0.1" ] || [ "${HOST}" = "localhost" ]; then
+  echo "Access URL: local reverse proxy required (recommended: run scripts/setup_https.sh)"
+else
+  echo "Access URL: http://${PUBLIC_IP}:${PORT}"
+fi
 echo "ADMIN_PASSWORD=${ADMIN_PASSWORD_PRINT}"
 echo ""
 echo "Health check: ${HEALTH_STATUS}"

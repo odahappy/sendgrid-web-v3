@@ -1,5 +1,7 @@
-SendGrid Web Admin Scheduler - Recipient Pool Warm-up Build
-Python 3.9 compatible
+SendGrid Web Admin Scheduler v3.2 - Recipient Pool Management Build
+Python 3.9+ compatible
+
+See OPTIMIZATION_NOTES.md for upgrade details.
 
 This build includes:
 
@@ -23,21 +25,24 @@ This build includes:
    - New tasks no longer select recipient lists manually.
    - When a plan is generated, the system automatically selects recipients from the two pools based on the selected tag.
    - Recipients added into a plan are marked as reserved and disappear from the available pool.
-   - The database does not physically delete recipients; it uses statuses: available / reserved / sent / failed.
+   - Unused available recipients can be edited or physically deleted from the management page.
+   - Used reserved / sent / failed recipients are retained for schedule and audit integrity.
    - If pool stock is insufficient, the page shows a popup alert and no plan is created.
    - Recipient pool upload supports selecting multiple TXT/CSV files at once.
-   - Recipient pool upload no longer enforces MAX_RECIPIENT_UPLOAD_BYTES.
+   - Recipient pool upload supports multiple files and enforces configurable per-file/count limits.
+   - Pool detail management supports pagination, search, individual edit/delete, and bulk deletion of unused available rows.
 
 4. Plan generation warm-up speed
    - Day 1: no more than 60 emails, randomized to 45-60
    - Day 2: no more than 200 emails, randomized to 185-200
    - Day 3: no more than 700 emails, randomized to 685-700
-   - Day 4-30: no more than 1000 emails per day, randomized to 985-1000/day
-   - The random 5-15 email difference never exceeds the configured upper bound.
+   - Day 4-30: requested warm-up ceiling is 1000 emails per day.
+   - Every day is additionally capped by the channel daily limit and existing channel plans.
+   - The random 5-15 email difference never exceeds either effective upper bound.
    - Day 4 now correctly starts at offset 3 internally, so there is no blank/misaligned fourth day.
 
 5. Pool state handling
-   - Task deletion releases pending/sending pool emails back to available.
+   - Task deletion releases pending pool emails; deletion/regeneration is blocked while a send is active.
    - Sent emails stay sent.
    - Failed emails stay failed and are not automatically returned to available.
    - Regeneration is blocked if a task already has sent records, preventing repeated sending.
@@ -51,7 +56,7 @@ This build includes:
    - Dashboard statistics:
      sent, delivered, opens, clicks, blocks, spam reports
    - SendGrid Event Webhook endpoint:
-     POST /api/sendgrid/events?token=YOUR_SERVICE_TOKEN
+     POST /api/sendgrid/events with X-INTERNAL-TOKEN (query token is optional and disabled by default)
 
 First install:
 Double click install_all_safe.bat
@@ -68,7 +73,8 @@ admin / admin123456
 Recommended:
 1. Edit .env before first start:
    ADMIN_PASSWORD=your strong password
-   SECRET_KEY=your random secret
+   SECRET_KEY=your random session secret
+   DATA_ENCRYPTION_KEY=a different random data key
    SERVICE_TOKEN=your random token
 2. Start the service.
 3. Login as admin.

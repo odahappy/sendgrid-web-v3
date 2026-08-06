@@ -243,7 +243,12 @@ def init_db():
             last_error TEXT,
             sender_response TEXT,
             created_at TEXT,
-            sent_at TEXT
+            sent_at TEXT,
+            recipient_pool_id INTEGER,
+            recipient_pool_type TEXT,
+            claimed_at TEXT,
+            worker_id TEXT,
+            channel_slot_date TEXT
         )
     """)
 
@@ -252,6 +257,12 @@ def init_db():
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN recipient_pool_id INTEGER")
     if "recipient_pool_type" not in scheduled_cols:
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN recipient_pool_type TEXT")
+    if "claimed_at" not in scheduled_cols:
+        cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN claimed_at TEXT")
+    if "worker_id" not in scheduled_cols:
+        cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN worker_id TEXT")
+    if "channel_slot_date" not in scheduled_cols:
+        cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN channel_slot_date TEXT")
 
 
     cur.execute("""
@@ -280,10 +291,14 @@ def init_db():
             date TEXT NOT NULL,
             sent_count INTEGER DEFAULT 0,
             failed_count INTEGER DEFAULT 0,
+            reserved_count INTEGER DEFAULT 0,
             last_error TEXT,
             UNIQUE(channel_id, date)
         )
     """)
+    stats_cols = {row[1] for row in cur.execute("PRAGMA table_info(channel_daily_stats)").fetchall()}
+    if "reserved_count" not in stats_cols:
+        cur.execute("ALTER TABLE channel_daily_stats ADD COLUMN reserved_count INTEGER DEFAULT 0")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sendgrid_events (
@@ -295,9 +310,13 @@ def init_db():
             smtp_id TEXT,
             reason TEXT,
             raw_json TEXT,
+            event_key TEXT,
             created_at TEXT
         )
     """)
+    event_cols = {row[1] for row in cur.execute("PRAGMA table_info(sendgrid_events)").fetchall()}
+    if "event_key" not in event_cols:
+        cur.execute("ALTER TABLE sendgrid_events ADD COLUMN event_key TEXT")
 
 
 
@@ -342,6 +361,8 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_task_recipient_lists_list ON mail_task_recipient_lists(list_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON sendgrid_events(event_type)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_msg ON sendgrid_events(sg_message_id)")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_key ON sendgrid_events(event_key) WHERE event_key IS NOT NULL")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_claim ON scheduled_email_tasks(status, claimed_at)")
     conn.commit()
     conn.close()
 
@@ -392,3 +413,12 @@ def execute_many(sql, rows):
 
 def today():
     return now_iso()[:10]
+
+
+def db_healthcheck():
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT 1 AS ok").fetchone()
+        return bool(row and row["ok"] == 1)
+    finally:
+        conn.close()

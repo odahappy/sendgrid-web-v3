@@ -6,6 +6,7 @@ EMAIL="${EMAIL:-}"
 APP_PORT="${APP_PORT:-9000}"
 APP_DIR="${APP_DIR:-/opt/sendgrid-web-admin}"
 NGINX_CONF_NAME="${NGINX_CONF_NAME:-sendgrid-web-admin}"
+SERVICE_NAME="${SERVICE_NAME:-sendgrid-web-admin}"
 
 if [ -z "$DOMAIN" ]; then
   echo "ERROR: DOMAIN is required."
@@ -67,7 +68,7 @@ server {
     listen 80;
     server_name ${DOMAIN};
 
-    client_max_body_size 0;
+    client_max_body_size 50m;
 
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -101,6 +102,19 @@ systemctl restart nginx
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 80/tcp >/dev/null 2>&1 || true
   ufw allow 443/tcp >/dev/null 2>&1 || true
+  ufw delete allow "${APP_PORT}/tcp" >/dev/null 2>&1 || true
+fi
+
+# Ensure the backend cannot be reached directly after HTTPS is enabled.
+if [ -f "${APP_DIR}/.env" ]; then
+  sed -i 's/^SERVER_HOST=.*/SERVER_HOST=127.0.0.1/' "${APP_DIR}/.env"
+  sed -i 's/^SESSION_COOKIE_SECURE=.*/SESSION_COOKIE_SECURE=true/' "${APP_DIR}/.env"
+fi
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+if [ -f "${SERVICE_FILE}" ]; then
+  sed -i -E 's/--host [^ ]+/--host 127.0.0.1/' "${SERVICE_FILE}"
+  systemctl daemon-reload
+  systemctl restart "${SERVICE_NAME}"
 fi
 
 echo "Testing HTTP access..."

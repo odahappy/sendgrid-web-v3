@@ -2,6 +2,7 @@
 2. Edit .env:
    ADMIN_PASSWORD
    SECRET_KEY
+   DATA_ENCRYPTION_KEY
    SERVICE_TOKEN
 3. Double click start_web_admin.bat
 4. Open http://127.0.0.1:8080
@@ -19,4 +20,6 @@ Day 2 <= 200, actual 185-200
 Day 3 <= 700, actual 685-700
 Day 4-30 <= 1000/day, actual 985-1000/day
 
-Recipient pool upload supports multi-file selection and no longer uses MAX_RECIPIENT_UPLOAD_BYTES.
+Recipient pool upload supports multi-file selection with configurable safety limits.
+
+Detailed reliability/security changes: OPTIMIZATION_NOTES.md

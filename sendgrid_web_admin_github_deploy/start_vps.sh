@@ -22,7 +22,7 @@ set -a
 source .env
 set +a
 
-HOST="${SERVER_HOST:-0.0.0.0}"
+HOST="${SERVER_HOST:-127.0.0.1}"
 PORT="${SERVER_PORT:-8080}"
 
 echo "Starting SendGrid Web Admin Scheduler on http://${HOST}:${PORT}"
