@@ -29,7 +29,7 @@ APT_RETRIES=5          # apt-get 最大尝试次数
 APT_RETRY_DELAY=10     # 每次重试前等待秒数
 ```
 
-重复运行安装命令会保留 `/opt/sendgrid-web-admin/.env`、数据库、上传文件和日志。
+重复运行安装命令会保留 `/opt/sendgrid-web-admin/.env`、`data/`、`uploads/`、`logs/` 和 `backups/`。同步新代码前，安装器会把现有 `.env` 与 SQLite 数据库的一致性快照保存到 `backups/pre-install-日期时间-随机字符/`；若备份失败，安装立即停止。自定义 `DATABASE_PATH` 也会受到同步保护。快照里的 `.env`、`database.db` 含敏感数据，应限制访问并定期清理不再需要的旧快照。
 
 ---
 
@@ -117,6 +117,46 @@ bash scripts/backup_sqlite.sh
 cd /opt/sendgrid-web-admin
 bash scripts/check_status.sh
 ```
+
+---
+
+## 升级与回滚
+
+升级前留存上一版本的项目源码，确认磁盘有足够空间容纳 SQLite 快照。重新执行安装命令后，记下输出中的 `Pre-install snapshot` 路径。已有的上传文件和日志会保留在原目录，但不会复制进这个升级前快照；若也需要独立备份上传文件，可提前运行 `bash scripts/backup_sqlite.sh`。
+
+回滚会把数据库恢复到升级前的状态，期间新增的任务、收件人和发送记录会丢失。停服务后，用上一版本源码覆盖程序文件，再恢复升级前的配置和数据库：
+
+```bash
+sudo systemctl stop sendgrid-web-admin
+APP_DIR=/opt/sendgrid-web-admin
+OLD_SRC=/path/to/previous/release/sendgrid_web_admin_github_deploy
+SNAP=/opt/sendgrid-web-admin/backups/pre-install-替换为实际快照目录名
+
+sudo rsync -a --delete \
+  --exclude '.venv' --exclude 'data' --exclude 'uploads' --exclude 'logs' \
+  --exclude '/.env' --exclude '/backups' \
+  "$OLD_SRC/" "$APP_DIR/"
+SERVICE_USER="$(systemctl show -p User --value sendgrid-web-admin)"
+SERVICE_USER="${SERVICE_USER:-root}"
+SERVICE_GROUP="$(systemctl show -p Group --value sendgrid-web-admin)"
+SERVICE_GROUP="${SERVICE_GROUP:-$(id -gn "$SERVICE_USER")}"
+sudo install -m 600 "$SNAP/.env" "$APP_DIR/.env"
+if [ -f "$SNAP/database.db" ]; then
+  DB_PATH="$(sudo cat "$SNAP/database-path.txt")"
+  sudo mkdir -p "$(dirname "$DB_PATH")"
+  sudo rm -f "$DB_PATH-wal" "$DB_PATH-shm"
+  sudo cp "$SNAP/database.db" "$DB_PATH"
+  sudo chown "$SERVICE_USER:$SERVICE_GROUP" "$DB_PATH"
+  sudo chmod 600 "$DB_PATH"
+fi
+sudo "$APP_DIR/.venv/bin/python" -m pip install -r "$APP_DIR/requirements.txt"
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"
+sudo chmod 600 "$APP_DIR/.env"
+sudo systemctl start sendgrid-web-admin
+sudo systemctl status sendgrid-web-admin --no-pager
+```
+
+如果快照里没有 `database.db` 与 `database-path.txt`，代表升级前尚未生成数据库，示例会跳过数据库恢复。上述操作假定安装目录和服务名保持默认值；自定义配置时使用实际路径和服务名。
 
 ---
 

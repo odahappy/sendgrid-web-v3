@@ -89,6 +89,18 @@ def init_db():
             updated_at TEXT
         )
     """)
+    list_cols = {row[1] for row in cur.execute("PRAGMA table_info(recipient_lists)").fetchall()}
+    if "consent_source" not in list_cols:
+        cur.execute("ALTER TABLE recipient_lists ADD COLUMN consent_source TEXT")
+    if "consented_at" not in list_cols:
+        cur.execute("ALTER TABLE recipient_lists ADD COLUMN consented_at TEXT")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS recipient_pool_list_members (
+            list_id INTEGER NOT NULL,
+            pool_id INTEGER NOT NULL,
+            PRIMARY KEY (list_id, pool_id)
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS recipients (
@@ -183,6 +195,35 @@ def init_db():
     mail_task_cols = {row[1] for row in cur.execute("PRAGMA table_info(mail_tasks)").fetchall()}
     if "recipient_list_id" not in mail_task_cols:
         cur.execute("ALTER TABLE mail_tasks ADD COLUMN recipient_list_id INTEGER")
+    for column, definition in (
+        ("task_kind", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("warmup_anchor_epoch", "INTEGER"),
+        ("warmup_days", "INTEGER"),
+        ("warmup_interval_mode", "TEXT"),
+        ("warmup_interval_seconds", "INTEGER"),
+        ("warmup_next_eligible_epoch", "INTEGER"),
+        ("warmup_consent_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in mail_task_cols:
+            cur.execute("ALTER TABLE mail_tasks ADD COLUMN {} {}".format(column, definition))
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS warmup_day_plans (
+            task_id INTEGER NOT NULL,
+            day_index INTEGER NOT NULL,
+            quota INTEGER NOT NULL CHECK (quota >= 0),
+            window_start_epoch INTEGER,
+            window_end_epoch INTEGER,
+            PRIMARY KEY (task_id, day_index)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS warmup_task_sources (
+            task_id INTEGER NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            PRIMARY KEY (task_id, source_type, source_id)
+        )
+    """)
     cur.execute("""
         UPDATE mail_tasks
         SET recipient_list_id = batch1_list_id
@@ -206,19 +247,19 @@ def init_db():
         INSERT OR IGNORE INTO mail_task_recipient_lists (task_id, list_id, sort_order, created_at)
         SELECT id, recipient_list_id, 0, COALESCE(created_at, ?)
         FROM mail_tasks
-        WHERE recipient_list_id IS NOT NULL
+        WHERE task_kind='legacy' AND recipient_list_id > 0
     """, (now_iso(),))
     cur.execute("""
         INSERT OR IGNORE INTO mail_task_recipient_lists (task_id, list_id, sort_order, created_at)
         SELECT id, batch1_list_id, 0, COALESCE(created_at, ?)
         FROM mail_tasks
-        WHERE batch1_list_id IS NOT NULL
+        WHERE task_kind='legacy' AND batch1_list_id > 0
     """, (now_iso(),))
     cur.execute("""
         INSERT OR IGNORE INTO mail_task_recipient_lists (task_id, list_id, sort_order, created_at)
         SELECT id, batch2_list_id, 1, COALESCE(created_at, ?)
         FROM mail_tasks
-        WHERE batch2_list_id IS NOT NULL
+        WHERE task_kind='legacy' AND batch2_list_id > 0
           AND batch2_list_id != batch1_list_id
     """, (now_iso(),))
 
@@ -263,6 +304,13 @@ def init_db():
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN worker_id TEXT")
     if "channel_slot_date" not in scheduled_cols:
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN channel_slot_date TEXT")
+    for column, definition in (
+        ("warmup_day_index", "INTEGER"),
+        ("warmup_due_epoch", "INTEGER"),
+        ("warmup_end_epoch", "INTEGER"),
+    ):
+        if column not in scheduled_cols:
+            cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN {} {}".format(column, definition))
 
 
     cur.execute("""
@@ -363,6 +411,10 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_msg ON sendgrid_events(sg_message_id)")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_key ON sendgrid_events(event_key) WHERE event_key IS NOT NULL")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_claim ON scheduled_email_tasks(status, claimed_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_warmup_due ON scheduled_email_tasks(status, warmup_due_epoch, warmup_end_epoch)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_warmup_day ON scheduled_email_tasks(task_id, warmup_day_index, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_members_pool ON recipient_pool_list_members(pool_id, list_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_members_list ON recipient_pool_list_members(list_id, pool_id)")
     conn.commit()
     conn.close()
 

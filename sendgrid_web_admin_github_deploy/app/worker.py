@@ -3,6 +3,7 @@ import time
 
 from .config import get_settings
 from .services import process_due_tasks
+from . import warmup
 from .utils import now_iso
 
 _worker_started = False
@@ -35,10 +36,25 @@ def worker_loop():
     print("[{}] Background worker started. interval={} max_tick={}".format(
         stamp, settings.worker_interval_seconds, settings.max_send_per_tick
     ))
+    warmup_first = True
     while True:
         _set_state(last_heartbeat_at=now_iso())
         try:
-            count = process_due_tasks(settings.max_send_per_tick)
+            # Reserve capacity for both task types under sustained load. The
+            # first share alternates when max_send_per_tick is odd (or one).
+            tick_limit = settings.max_send_per_tick
+            warmup_budget = (tick_limit + (1 if warmup_first else 0)) // 2
+            legacy_budget = tick_limit - warmup_budget
+            warmup_first = not warmup_first
+            warmup_count = warmup.process_due_tasks(warmup_budget) if warmup_budget else 0
+            legacy_count = process_due_tasks(legacy_budget) if legacy_budget else 0
+            count = warmup_count + legacy_count
+            remaining = tick_limit - count
+            if remaining:
+                if warmup_count < warmup_budget:
+                    count += process_due_tasks(remaining)
+                elif legacy_count < legacy_budget:
+                    count += warmup.process_due_tasks(remaining)
             stamp = now_iso()
             _set_state(last_heartbeat_at=stamp, last_success_at=stamp, last_error=None)
             if count:

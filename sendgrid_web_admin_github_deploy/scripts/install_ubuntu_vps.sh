@@ -189,6 +189,76 @@ echo "Copying project to ${APP_DIR} ..."
 
 "${SUDO[@]}" mkdir -p "$APP_DIR"
 
+# Keep the live configuration and a consistent SQLite snapshot before changing
+# application files.  The backup must succeed before rsync is allowed to run.
+DB_EXCLUDES=()
+if "${SUDO[@]}" test -f "$APP_DIR/.env" \
+  || "${SUDO[@]}" test -f "$APP_DIR/data/web_admin_scheduler.db"; then
+  "${SUDO[@]}" mkdir -p -m 700 "$APP_DIR/backups"
+  PRE_INSTALL_BACKUP="$("${SUDO[@]}" mktemp -d "$APP_DIR/backups/pre-install-$(date +%Y%m%d_%H%M%S)-XXXXXXXX")"
+
+  if "${SUDO[@]}" test -f "$APP_DIR/.env"; then
+    "${SUDO[@]}" install -m 600 "$APP_DIR/.env" "$PRE_INSTALL_BACKUP/.env"
+  fi
+
+  # The application resolves relative DATABASE_PATH values from APP_DIR. Use
+  # sqlite3.backup so that writes in WAL mode are included in the snapshot.
+  DB_RELATIVE_PATH="$("${SUDO[@]}" python3 - "$APP_DIR" "$PRE_INSTALL_BACKUP" <<'PY'
+import os
+import pathlib
+import shlex
+import sqlite3
+import sys
+
+app_dir = pathlib.Path(sys.argv[1])
+backup_dir = pathlib.Path(sys.argv[2])
+configured_path = 'data/web_admin_scheduler.db'
+env_file = app_dir / '.env'
+if env_file.is_file():
+    for line in env_file.read_text(encoding='utf-8').splitlines():
+        setting = line.strip()
+        if setting.startswith('export '):
+            setting = setting[7:].lstrip()
+        if setting.startswith('DATABASE_PATH='):
+            parts = shlex.split(setting.partition('=')[2], comments=True)
+            if len(parts) != 1 or not parts[0] or '$' in parts[0]:
+                raise SystemExit('Cannot safely back up DATABASE_PATH in .env')
+            configured_path = parts[0]
+
+db_path = pathlib.Path(configured_path)
+if not db_path.is_absolute():
+    db_path = app_dir / db_path
+db_path = pathlib.Path(os.path.abspath(db_path))
+
+if db_path.is_file():
+    source = sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
+    destination = sqlite3.connect(backup_dir / 'database.db')
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    (backup_dir / 'database-path.txt').write_text(str(db_path) + '\n', encoding='utf-8')
+elif db_path.exists():
+    raise SystemExit(f'Configured database path is not a file: {db_path}')
+
+try:
+    print(db_path.relative_to(pathlib.Path(os.path.abspath(app_dir))))
+except ValueError:
+    pass
+PY
+)"
+
+  if [ -n "$DB_RELATIVE_PATH" ]; then
+    DB_EXCLUDES+=(
+      --exclude "/$DB_RELATIVE_PATH"
+      --exclude "/$DB_RELATIVE_PATH-wal"
+      --exclude "/$DB_RELATIVE_PATH-shm"
+    )
+  fi
+  echo "Pre-install snapshot: ${PRE_INSTALL_BACKUP}"
+fi
+
 "${SUDO[@]}" rsync \
   -a \
   --delete \
@@ -196,7 +266,10 @@ echo "Copying project to ${APP_DIR} ..."
   --exclude 'data' \
   --exclude 'uploads' \
   --exclude 'logs' \
+  --exclude '/.env' \
+  --exclude '/backups' \
   --exclude '.git' \
+  "${DB_EXCLUDES[@]}" \
   "$SRC_DIR"/ \
   "$APP_DIR"/
 
@@ -272,6 +345,8 @@ else
   echo "Keeping existing configuration."
 
 fi
+
+"${SUDO[@]}" chmod 600 .env
 
 ADMIN_PASSWORD_PRINT="$(
   grep '^ADMIN_PASSWORD=' "$APP_DIR/.env" \

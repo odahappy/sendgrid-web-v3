@@ -214,6 +214,40 @@ class ReliabilityTests(unittest.TestCase):
             0,
         )
 
+    def test_logged_provider_acceptance_is_not_resent_after_worker_crash(self):
+        tag_id, channel_id, group_id = self.create_resources("accepted-crash", daily_limit=1)
+        self.seed_plan_pool(tag_id, "accepted-crash", daily_limit=1)
+        task_id = services.create_mail_task(tag_id, channel_id, "accepted", "Hello", group_id)
+        services.generate_plan(task_id)
+        scheduled = q_one(
+            "SELECT * FROM scheduled_email_tasks WHERE task_id=? ORDER BY id LIMIT 1",
+            (task_id,),
+        )
+        old_claim = (datetime.now() - timedelta(minutes=10)).isoformat(timespec="seconds")
+        execute(
+            "UPDATE scheduled_email_tasks SET status='sending',claimed_at=?,worker_id=? WHERE id=?",
+            (old_claim, "dead-after-202", scheduled["id"]),
+        )
+        slot_date = services._reserve_channel_slot(channel_id, 1, scheduled["id"], "dead-after-202")
+        execute(
+            """INSERT INTO send_log
+               (scheduled_task_id,task_id,channel_id,recipient_email,http_status,status,created_at)
+               VALUES (?,?,?,?,202,'sent',?)""",
+            (scheduled["id"], task_id, channel_id, scheduled["recipient_email"], old_claim),
+        )
+        self.assertEqual(services._recover_stale_sending_claims(), 1)
+        self.assertEqual(q_one(
+            "SELECT status FROM scheduled_email_tasks WHERE id=?", (scheduled["id"],)
+        )["status"], "sent")
+        stats = q_one(
+            "SELECT sent_count,reserved_count FROM channel_daily_stats WHERE channel_id=? AND date=?",
+            (channel_id, slot_date),
+        )
+        self.assertEqual((stats["sent_count"], stats["reserved_count"]), (1, 0))
+        self.assertEqual(q_one(
+            "SELECT status FROM recipient_pool WHERE id=?", (scheduled["recipient_pool_id"],)
+        )["status"], "sent")
+
     def test_crypto_and_webhook_deduplication(self):
         value = "SG.secret-value"
         protected = protect(value)

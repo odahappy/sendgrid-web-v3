@@ -15,7 +15,7 @@ from .config import get_settings, validate_settings
 from .db import init_db, db_healthcheck
 from .utils import find_available_port
 from .worker import start_worker_once, worker_status
-from . import services
+from . import services, warmup
 
 settings = get_settings()
 app = FastAPI(title="SendGrid Web Admin Scheduler", version="3.2.0")
@@ -69,13 +69,23 @@ def _file_extension(filename):
 
 
 
+def _script_json(value):
+    """Keep JSON values from ending an inline script element."""
+    return (json.dumps(str(value), ensure_ascii=False)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029"))
+
+
 def _alert_redirect(message, target="/#tasks"):
     return HTMLResponse("""
 <!doctype html><meta charset="utf-8"><script>
 alert(%s);
 location.href = %s;
 </script>
-""" % (json.dumps(str(message), ensure_ascii=False), json.dumps(target, ensure_ascii=False)))
+""" % (_script_json(message), _script_json(target)))
 
 
 async def _read_limited_upload(file: UploadFile, allowed_extensions, max_bytes, label):
@@ -158,6 +168,7 @@ def index(request: Request):
     except HTTPException:
         return templates.TemplateResponse("login.html", {"request": request, "error": "会话已失效，请重新登录。"})
     data = services.get_dashboard_data()
+    data.update(warmup.dashboard_data())
     data["request"] = request
     data["current_user"] = current_user
     return templates.TemplateResponse("admin.html", data)
@@ -233,7 +244,7 @@ def update_user(
 def create_tag(request: Request, name: str = Form(...), service_type: str = Form(...), remark: str = Form("")):
     require_login(request)
     services.create_tag(name, service_type, remark)
-    return RedirectResponse("/#tags", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @app.post("/proxies/create")
@@ -247,8 +258,8 @@ def create_proxy(
     proxy_id = services.create_proxy(name, proxy_url)
     if test_now:
         result = services.test_proxy(proxy_id)
-        return _alert_redirect(result.get("message") or "代理测试完成", "/#proxies")
-    return RedirectResponse("/#proxies", status_code=303)
+        return _alert_redirect(result.get("message") or "代理测试完成", "/#settings")
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @app.post("/proxies/{proxy_id}/test")
@@ -256,9 +267,9 @@ def test_proxy(request: Request, proxy_id: int):
     require_login(request)
     try:
         result = services.test_proxy(proxy_id)
-        return _alert_redirect(result.get("message") or "代理测试完成", "/#proxies")
+        return _alert_redirect(result.get("message") or "代理测试完成", "/#settings")
     except Exception as exc:
-        return _alert_redirect("代理测试失败：{}".format(exc), "/#proxies")
+        return _alert_redirect("代理测试失败：{}".format(exc), "/#settings")
 
 
 @app.post("/channels/create")
@@ -274,7 +285,7 @@ def create_channel(
 ):
     require_login(request)
     services.create_channel(tag_id, name, api_key, from_email, from_name, int(proxy_id) if proxy_id else None, daily_limit)
-    return RedirectResponse("/#channels", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @app.post("/channels/{channel_id}/update")
@@ -292,7 +303,7 @@ def update_channel(
 ):
     require_login(request)
     services.update_channel(channel_id, tag_id, name, api_key, from_email, from_name, int(proxy_id) if proxy_id else None, daily_limit, status)
-    return RedirectResponse("/#channels", status_code=303)
+    return RedirectResponse("/#settings", status_code=303)
 
 
 @app.post("/recipients/upload")
@@ -469,6 +480,122 @@ def template_file_update(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return RedirectResponse("/#templates", status_code=303)
+
+
+@app.post("/warmup/lists/upload")
+async def warmup_list_upload(
+    request: Request,
+    tag_id: int = Form(...),
+    name: str = Form(...),
+    consent_source: str = Form(...),
+    consented_at: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    require_login(request)
+    s = get_settings()
+    try:
+        if not files:
+            raise ValueError("请至少选择一个 TXT/CSV 收件人文件。")
+        if len(files) > s.max_recipient_files_per_upload:
+            raise ValueError("收件人文件超过数量限制（最多 {} 个）。".format(s.max_recipient_files_per_upload))
+        contents = []
+        for file in files:
+            contents.append(await _read_limited_upload(
+                file, RECIPIENT_EXTENSIONS, s.max_recipient_upload_bytes, "warmup list"
+            ))
+        warmup.import_named_list(tag_id, name, consent_source, consented_at, b"\n".join(contents))
+    except (HTTPException, ValueError) as exc:
+        return _alert_redirect(getattr(exc, "detail", str(exc)), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/create")
+def warmup_create(
+    request: Request,
+    tag_id: int = Form(...),
+    channel_id: int = Form(...),
+    name: str = Form(...),
+    subject_template: str = Form(...),
+    template_group_id: int = Form(...),
+    day_counts: list[str] = Form(...),
+    source_pool_types: list[str] = Form([]),
+    source_list_ids: list[int] = Form([]),
+    interval_mode: str = Form(...),
+    interval_seconds: str = Form(""),
+    consent_confirmed: str = Form(""),
+):
+    require_login(request)
+    try:
+        warmup.create_task(
+            tag_id, channel_id, name, subject_template, template_group_id,
+            day_counts, interval_mode, interval_seconds,
+            source_pool_types, source_list_ids, consent_confirmed,
+        )
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/lists/{list_id}/disable")
+def warmup_list_disable(request: Request, list_id: int):
+    require_login(request)
+    try:
+        warmup.disable_named_list(list_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/{task_id}/start")
+def warmup_start(request: Request, task_id: int):
+    require_login(request)
+    try:
+        warmup.start_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/{task_id}/pause")
+def warmup_pause(request: Request, task_id: int):
+    require_login(request)
+    try:
+        warmup.pause_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/{task_id}/resume")
+def warmup_resume(request: Request, task_id: int):
+    require_login(request)
+    try:
+        warmup.resume_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/{task_id}/delete")
+def warmup_delete(request: Request, task_id: int):
+    require_login(request)
+    try:
+        warmup.delete_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
+
+
+@app.post("/warmup/review/{schedule_id}/resolve")
+def warmup_review_resolve(request: Request, schedule_id: int, resolution: str = Form(...)):
+    require_admin(request)
+    try:
+        if resolution not in {"accepted", "failed"}:
+            raise ValueError("无效的处理结果。")
+        warmup.resolve_review(schedule_id, resolution)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#warmup")
+    return RedirectResponse("/#warmup", status_code=303)
 
 
 @app.post("/tasks/create")

@@ -91,3 +91,14 @@ Upgrade:
 Important:
 Only use opted-in or legitimate recipients.
 For marketing emails, include unsubscribe links.
+
+Custom warm-up system:
+- 标签 / API 通道 / 代理 now share one Settings page.
+- Warm-up tasks have user-entered 1–90 days, required daily counts (0 is a rest day),
+  automatic 24-hour spacing or a manual interval, and selectable recipient sources
+  and HTML template groups. First Start fixes the 24-hour clock; saving a draft does not.
+- Existing 0–3/4–30 pools can be selected, or a named consent-based list can be uploaded.
+  Named lists remain separate from legacy 30-day automatic pool selection.
+- Unsent items that miss their 24-hour window are skipped; uncertain sends require
+  administrator review. HTTP 202 means accepted by SendGrid, not delivered.
+- See WARMUP_GUIDE.md for setup, limits, status meanings, and upgrade behavior.
