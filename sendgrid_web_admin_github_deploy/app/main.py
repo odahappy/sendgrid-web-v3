@@ -302,7 +302,11 @@ def update_channel(
     status: str = Form("active"),
 ):
     require_login(request)
-    services.update_channel(channel_id, tag_id, name, api_key, from_email, from_name, int(proxy_id) if proxy_id else None, daily_limit, status)
+    try:
+        services.update_channel(channel_id, tag_id, name, api_key, from_email, from_name,
+                                int(proxy_id) if proxy_id else None, daily_limit, status)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#settings")
     return RedirectResponse("/#settings", status_code=303)
 
 
@@ -310,7 +314,6 @@ def update_channel(
 async def recipients_upload(
     request: Request,
     tag_id: int = Form(...),
-    pool_type: str = Form(...),
     name: str = Form(""),
     files: list[UploadFile] = File(...),
 ):
@@ -336,7 +339,7 @@ async def recipients_upload(
         try:
             content = await _read_limited_upload(file, RECIPIENT_EXTENSIONS, s.max_recipient_upload_bytes, "recipient pool")
             source = name.strip() if name and name.strip() else filename
-            result = services.import_recipient_pool(tag_id, pool_type, source, content)
+            result = services.import_recipient_pool(tag_id, services.POOL_UNIFIED, source, content)
             total_parsed += int(result.get("parsed") or 0)
             total_imported += int(result.get("imported") or 0)
             total_duplicates += int(result.get("duplicates") or 0)
@@ -373,7 +376,6 @@ def recipients_update(
     request: Request,
     recipient_id: int,
     tag_id: int = Form(...),
-    pool_type: str = Form(...),
     email: str = Form(...),
     name: str = Form(""),
     source_name: str = Form(""),
@@ -381,7 +383,7 @@ def recipients_update(
     require_login(request)
     try:
         services.update_recipient_pool_entry(
-            recipient_id, tag_id, pool_type, email, name, source_name
+            recipient_id, tag_id, None, email, name, source_name
         )
     except ValueError as exc:
         return _alert_redirect(str(exc), "/#recipients")
@@ -402,11 +404,10 @@ def recipients_delete(request: Request, recipient_id: int):
 def recipients_delete_available(
     request: Request,
     tag_id: int = Form(...),
-    pool_type: str = Form(...),
 ):
     require_login(request)
     try:
-        result = services.delete_available_recipient_pool(tag_id, pool_type)
+        result = services.delete_available_recipient_pool(tag_id)
     except ValueError as exc:
         return _alert_redirect(str(exc), "/#recipients")
     return _alert_redirect(
@@ -420,6 +421,8 @@ async def templates_upload(
     request: Request,
     tag_id: int = Form(...),
     name: str = Form(...),
+    subject_template: str = Form(...),
+    from_name: str = Form(...),
     files: list[UploadFile] = File(...),
 ):
     require_login(request)
@@ -439,9 +442,10 @@ async def templates_upload(
         )
         validated_files.append((f.filename, content))
 
-    group_id = services.create_template_group(tag_id, name)
-    for filename, content in validated_files:
-        services.save_template_file(group_id, filename, content)
+    try:
+        services.upload_template_group(tag_id, name, validated_files, subject_template, from_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return RedirectResponse("/#templates", status_code=303)
 
 
@@ -454,7 +458,10 @@ def template_group_update(
     status: str = Form("active"),
 ):
     require_login(request)
-    services.update_template_group(group_id, tag_id, name, status)
+    try:
+        services.update_template_group(group_id, tag_id, name, status)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#templates")
     return RedirectResponse("/#templates", status_code=303)
 
 
@@ -473,10 +480,12 @@ def template_file_update(
     request: Request,
     file_id: int,
     html_content: str = Form(""),
+    subject_template: str = Form(...),
+    from_name: str = Form(...),
 ):
     require_login(request)
     try:
-        services.update_template_file_content(file_id, html_content)
+        services.update_template_file_content(file_id, html_content, subject_template, from_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return RedirectResponse("/#templates", status_code=303)
@@ -515,10 +524,10 @@ def warmup_create(
     tag_id: int = Form(...),
     channel_id: int = Form(...),
     name: str = Form(...),
-    subject_template: str = Form(...),
+    subject_template: str = Form(""),
     template_group_id: int = Form(...),
     day_counts: list[str] = Form(...),
-    source_pool_types: list[str] = Form([]),
+    source_mode: str = Form("all"),
     source_list_ids: list[int] = Form([]),
     interval_mode: str = Form(...),
     interval_seconds: str = Form(""),
@@ -526,6 +535,11 @@ def warmup_create(
 ):
     require_login(request)
     try:
+        if source_mode not in {"all", "lists"}:
+            raise ValueError("请选择统一收件人池或具名名单。")
+        if source_mode == "all" and source_list_ids:
+            raise ValueError("全部收件人和指定名单不能同时选择。")
+        source_pool_types = [services.POOL_UNIFIED] if source_mode == "all" else []
         warmup.create_task(
             tag_id, channel_id, name, subject_template, template_group_id,
             day_counts, interval_mode, interval_seconds,
@@ -604,12 +618,18 @@ def tasks_create(
     tag_id: int = Form(...),
     channel_id: int = Form(...),
     name: str = Form(...),
-    subject_template: str = Form(...),
+    subject_template: str = Form(""),
     template_group_id: int = Form(...),
 ):
     require_login(request)
+    return _alert_redirect("请在预热系统中创建新任务。旧版任务仅用于管理既有记录。", "/#warmup")
+
+
+@app.post("/tasks/review/{schedule_id}/resolve")
+def legacy_review_resolve(request: Request, schedule_id: int, resolution: str = Form(...)):
+    require_admin(request)
     try:
-        services.create_mail_task(tag_id, channel_id, name, subject_template, template_group_id)
+        services.resolve_legacy_review(schedule_id, resolution)
     except ValueError as exc:
         return _alert_redirect(str(exc), "/#tasks")
     return RedirectResponse("/#tasks", status_code=303)
@@ -638,21 +658,30 @@ def regenerate_task(request: Request, task_id: int):
 @app.post("/tasks/{task_id}/start")
 def start_task(request: Request, task_id: int):
     require_login(request)
-    services.start_task(task_id)
+    try:
+        services.start_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#tasks")
     return RedirectResponse("/#tasks", status_code=303)
 
 
 @app.post("/tasks/{task_id}/pause")
 def pause_task(request: Request, task_id: int):
     require_login(request)
-    services.pause_task(task_id)
+    try:
+        services.pause_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#tasks")
     return RedirectResponse("/#tasks", status_code=303)
 
 
 @app.post("/tasks/{task_id}/resume")
 def resume_task(request: Request, task_id: int):
     require_login(request)
-    services.resume_task(task_id)
+    try:
+        services.resume_task(task_id)
+    except ValueError as exc:
+        return _alert_redirect(str(exc), "/#tasks")
     return RedirectResponse("/#tasks", status_code=303)
 
 
@@ -688,7 +717,6 @@ def api_tag_detail(request: Request, tag_id: int):
 def api_recipient_pool_rows(
     request: Request,
     tag_id: int,
-    pool_type: str,
     status: str = "",
     search: str = "",
     page: int = 1,
@@ -697,7 +725,7 @@ def api_recipient_pool_rows(
     require_login(request)
     try:
         result = services.get_recipient_pool_rows(
-            tag_id, pool_type, status, search, page, page_size
+            tag_id, status=status, search=search, page=page, page_size=page_size
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

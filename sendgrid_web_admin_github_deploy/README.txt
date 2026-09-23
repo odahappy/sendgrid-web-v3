@@ -1,7 +1,8 @@
-SendGrid Web Admin Scheduler v3.2 - Recipient Pool Management Build
+SendGrid Web Admin Scheduler - Single Recipient Pool and Template Metadata
 Python 3.9+ compatible
 
-See OPTIMIZATION_NOTES.md for upgrade details.
+See WARMUP_GUIDE.md for current warm-up behavior. OPTIMIZATION_NOTES.md
+describes the earlier v3.2 release and is retained as a historical record.
 
 This build includes:
 
@@ -18,12 +19,11 @@ This build includes:
      ADMIN_USERNAME
      ADMIN_PASSWORD
 
-3. Recipient pool upload changed
-   - Recipients are now managed in two reusable pools:
-     * 0-3天库: used for day 1, day 2 and day 3
-     * 4-30天库: used for day 4 through day 30
-   - New tasks no longer select recipient lists manually.
-   - When a plan is generated, the system automatically selects recipients from the two pools based on the selected tag.
+3. One recipient pool
+   - Upload TXT/CSV files into one shared pool. A recipient is counted once per tag.
+   - Named lists are filters over this pool, not separate recipient inventories.
+   - The fixed 30-day task takes available recipients for its tag from this pool.
+   - A custom warm-up task can use the full pool or a named-list filter.
    - Recipients added into a plan are marked as reserved and disappear from the available pool.
    - Unused available recipients can be edited or physically deleted from the management page.
    - Used reserved / sent / failed recipients are retained for schedule and audit integrity.
@@ -31,8 +31,18 @@ This build includes:
    - Recipient pool upload supports selecting multiple TXT/CSV files at once.
    - Recipient pool upload supports multiple files and enforces configurable per-file/count limits.
    - Pool detail management supports pagination, search, individual edit/delete, and bulk deletion of unused available rows.
+   - Upgrading preserves existing plans, reservations, send records and named-list membership.
 
-4. Plan generation warm-up speed
+4. HTML template metadata
+   - At upload, enter a subject and sender display name once. Both values are
+     initially bound to every HTML file in that upload; edit files individually later.
+   - A template group may contain multiple files with different subjects and sender names.
+   - The sender email address and API credentials still come from the selected API channel.
+   - New plans use the selected file's bound subject and sender name. Existing scheduled
+     emails keep the values already recorded in their plans. Older template files
+     without bindings use the existing task subject and channel sender name.
+
+5. Fixed 30-day plan generation speed
    - Day 1: no more than 60 emails, randomized to 45-60
    - Day 2: no more than 200 emails, randomized to 185-200
    - Day 3: no more than 700 emails, randomized to 685-700
@@ -41,13 +51,13 @@ This build includes:
    - The random 5-15 email difference never exceeds either effective upper bound.
    - Day 4 now correctly starts at offset 3 internally, so there is no blank/misaligned fourth day.
 
-5. Pool state handling
+6. Pool state handling
    - Task deletion releases pending pool emails; deletion/regeneration is blocked while a send is active.
    - Sent emails stay sent.
    - Failed emails stay failed and are not automatically returned to available.
    - Regeneration is blocked if a task already has sent records, preventing repeated sending.
 
-6. UI features preserved
+7. UI features preserved
    - API channel edit/update
    - HTML source popup TXT editor
    - Task page and schedule page separated
@@ -95,10 +105,10 @@ For marketing emails, include unsubscribe links.
 Custom warm-up system:
 - 标签 / API 通道 / 代理 now share one Settings page.
 - Warm-up tasks have user-entered 1–90 days, required daily counts (0 is a rest day),
-  automatic 24-hour spacing or a manual interval, and selectable recipient sources
+  automatic 24-hour spacing or a manual interval, and selectable recipient filters
   and HTML template groups. First Start fixes the 24-hour clock; saving a draft does not.
-- Existing 0–3/4–30 pools can be selected, or a named consent-based list can be uploaded.
-  Named lists remain separate from legacy 30-day automatic pool selection.
+- One pool serves both fixed 30-day and custom warm-up tasks. A named list filters
+  eligible addresses in that pool and never creates another pool.
 - Unsent items that miss their 24-hour window are skipped; uncertain sends require
   administrator review. HTTP 202 means accepted by SendGrid, not delivered.
 - See WARMUP_GUIDE.md for setup, limits, status meanings, and upgrade behavior.

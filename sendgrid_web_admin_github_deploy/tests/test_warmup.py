@@ -7,13 +7,15 @@ services._send_via_sendgrid boundary, and every test gets a fresh SQLite DB.
 import os
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import services, warmup
-from app.db import execute, init_db, q_all, q_one
+from app.db import execute, get_conn, init_db, q_all, q_one
 
 
 START_EPOCH = int(datetime(2026, 9, 23, 23, 50, tzinfo=timezone.utc).timestamp())
@@ -123,6 +125,59 @@ class WarmupTests(unittest.TestCase):
         self.assertEqual(due, [START_EPOCH, START_EPOCH + DAY // 3, START_EPOCH + 2 * DAY // 3])
         self.assertLess(due[-1], START_EPOCH + DAY)
 
+    def test_manual_50000_seconds_sleeps_until_exact_next_window(self):
+        list_id = self.add_list("a@example.com", "b@example.com", "c@example.com")
+        task_id = self.create_task([2, 1], lists=[list_id], interval=50000)
+        warmup.start_task(task_id, now_epoch=START_EPOCH)
+        due = [int(row["warmup_due_epoch"]) for row in self.rows(task_id)]
+        self.assertEqual(due, [START_EPOCH, START_EPOCH + 50000, START_EPOCH + DAY])
+
+        sent = []
+        def accepted(row):
+            sent.append(row["id"])
+            return True, "fake-message-id", None, "accepted"
+
+        with patch.object(services, "_send_via_sendgrid", side_effect=accepted):
+            warmup.process_due_tasks(10, now_epoch=START_EPOCH)
+            warmup.process_due_tasks(10, now_epoch=START_EPOCH + 50000)
+            warmup.process_due_tasks(10, now_epoch=START_EPOCH + DAY - 1)
+            self.assertEqual(len(sent), 2)
+            warmup.process_due_tasks(10, now_epoch=START_EPOCH + DAY)
+        self.assertEqual(len(sent), 3)
+
+    def test_dst_change_keeps_epoch_windows_and_expires_stale_day(self):
+        if not hasattr(time, "tzset"):
+            self.skipTest("TZ switch requires time.tzset")
+        previous_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            # November 1, 2026 ends DST in New York. Local times shift, while
+            # each campaign day must still be exactly 86,400 elapsed seconds.
+            anchor = int(datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc).timestamp())
+            list_id = self.add_list("old@example.com", "next@example.com")
+            task_id = self.create_task([1, 1], lists=[list_id])
+            warmup.start_task(task_id, now_epoch=anchor)
+            old, next_day = self.rows(task_id)
+            self.assertEqual(next_day["warmup_due_epoch"] - old["warmup_due_epoch"], DAY)
+            self.assertEqual(datetime.fromtimestamp(old["warmup_due_epoch"]).hour, 8)
+            self.assertEqual(datetime.fromtimestamp(next_day["warmup_due_epoch"]).hour, 7)
+
+            with patch.object(services, "_send_via_sendgrid",
+                              return_value=(True, "fake-message-id", None, "accepted")) as sender:
+                warmup.process_due_tasks(10, now_epoch=anchor + DAY + 1)
+                self.assertEqual(sender.call_count, 1)
+            self.assertEqual(
+                {row["id"]: row["status"] for row in self.rows(task_id)},
+                {old["id"]: "missed", next_day["id"]: "sent"},
+            )
+        finally:
+            if previous_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous_tz
+            time.tzset()
+
     def test_manual_interval_that_crosses_window_is_rejected(self):
         list_id = self.add_list("a@example.com", "b@example.com", "c@example.com")
         # The third send would land exactly at the next 24-hour window.
@@ -149,6 +204,264 @@ class WarmupTests(unittest.TestCase):
         )
         self.assertTrue(all(row["html_file"] for row in rows))
         self.assertTrue(all(row["status"] == "pending" for row in rows))
+
+    def test_unified_source_deduplicates_three_legacy_rows_and_reuses_list_member(self):
+        self.add_pool(services.POOL_0_3, "shared@example.com", "early@example.com")
+        self.add_pool(services.POOL_4_30, "shared@example.com", "late@example.com")
+        self.add_pool("warmup_named", "shared@example.com")
+        existing_ids = {
+            row["id"] for row in q_all(
+                "SELECT id FROM recipient_pool WHERE tag_id=? AND email=?",
+                (self.tag, "shared@example.com"),
+            )
+        }
+        self.assertEqual(len(existing_ids), 3)
+        list_id = self.add_list("shared@example.com", "named@example.com")
+        members = q_all("""
+            SELECT p.id FROM recipient_pool_list_members lm
+            JOIN recipient_pool p ON p.id=lm.pool_id
+            WHERE lm.list_id=? AND p.email='shared@example.com'
+        """, (list_id,))
+        self.assertEqual(len(members), 1)
+        self.assertIn(members[0]["id"], existing_ids)
+        self.assertEqual(q_one(
+            "SELECT COUNT(*) AS c FROM recipient_pool WHERE tag_id=? AND email=?",
+            (self.tag, "shared@example.com"),
+        )["c"], 3)
+
+        task_id = self.create_task([4], pools=["unified"], interval=1)
+        warmup.start_task(task_id, now_epoch=START_EPOCH)
+        emails = [row["recipient_email"] for row in self.rows(task_id)]
+        self.assertEqual(len(emails), 4)
+        self.assertEqual(len(set(emails)), 4)
+        self.assertIn("shared@example.com", emails)
+
+    def test_disabled_named_only_address_cannot_start_unified_source(self):
+        list_id = self.add_list("named-only@example.com")
+        self.assertEqual(q_one(
+            "SELECT pool_type FROM recipient_pool WHERE tag_id=? AND email=?",
+            (self.tag, "named-only@example.com"),
+        )["pool_type"], "warmup_named")
+        warmup.disable_named_list(list_id)
+        task_id = self.create_task([1], pools=[services.POOL_UNIFIED])
+        with self.assertRaises(ValueError):
+            warmup.start_task(task_id, now_epoch=START_EPOCH)
+        self.assertEqual(self.rows(task_id), [])
+
+    def test_disabling_named_only_source_after_unified_plan_blocks_post(self):
+        list_id = self.add_list("later-disabled@example.com")
+        task_id = self.create_task([1], pools=[services.POOL_UNIFIED])
+        warmup.start_task(task_id, now_epoch=START_EPOCH)
+        planned = self.rows(task_id)[0]
+        warmup.disable_named_list(list_id)
+
+        with patch.object(services.requests, "post") as post:
+            warmup.process_due_tasks(1, now_epoch=START_EPOCH)
+            post.assert_not_called()
+        self.assertEqual(self.rows(task_id)[0]["status"], "missed")
+        self.assertEqual(q_one(
+            "SELECT status FROM recipient_pool WHERE id=?", (planned["recipient_pool_id"],)
+        )["status"], "available")
+
+    def test_disabling_list_does_not_disable_independent_pool_address(self):
+        services.import_recipient_pool(
+            self.tag, services.POOL_UNIFIED, "ordinary pool", b"ordinary@example.com"
+        )
+        original = q_one(
+            "SELECT id,pool_type FROM recipient_pool WHERE tag_id=? AND email=?",
+            (self.tag, "ordinary@example.com"),
+        )
+        list_id = self.add_list("ordinary@example.com")
+        member = q_one(
+            "SELECT pool_id FROM recipient_pool_list_members WHERE list_id=?", (list_id,)
+        )
+        self.assertEqual(member["pool_id"], original["id"])
+        named_task = self.create_task([1], lists=[list_id])
+        warmup.disable_named_list(list_id)
+        with self.assertRaises(ValueError):
+            warmup.start_task(named_task, now_epoch=START_EPOCH)
+
+        pool_task = self.create_task([1], pools=[services.POOL_UNIFIED])
+        warmup.start_task(pool_task, now_epoch=START_EPOCH)
+        self.assertEqual(self.rows(pool_task)[0]["recipient_pool_id"], original["id"])
+
+    def test_failed_duplicate_blocks_available_row_in_unified_source(self):
+        self.add_pool(services.POOL_UNIFIED, "duplicate@example.com")
+        self.add_pool(services.POOL_0_3, "duplicate@example.com")
+        execute("""
+            UPDATE recipient_pool SET status='failed'
+            WHERE tag_id=? AND email=? AND pool_type=?
+        """, (self.tag, "duplicate@example.com", services.POOL_0_3))
+        task_id = self.create_task([1], pools=[services.POOL_UNIFIED])
+        with self.assertRaises(ValueError):
+            warmup.start_task(task_id, now_epoch=START_EPOCH)
+        self.assertEqual(self.rows(task_id), [])
+
+    def test_template_file_binding_matches_real_sendgrid_json(self):
+        group_id = services.upload_template_group(
+            self.tag, "bound HTML", [
+                ("alpha.html", b"<p>ALPHA {{to_email}}</p>"),
+                ("beta.html", b"<p>BETA {{to_email}}</p>"),
+            ], "Alpha {{code8}}", "Alpha Sender",
+        )
+        files = q_all("SELECT * FROM template_files WHERE group_id=? ORDER BY id", (group_id,))
+        services.update_template_file_content(
+            files[1]["id"], "<p>BETA {{to_email}}</p>",
+            "Beta {{code8}}", "Beta Sender",
+        )
+        list_id = self.add_list("alpha@example.com", "beta@example.com")
+        task_id = self.create_task([2], lists=[list_id], group_id=group_id, interval=1)
+        indexes = iter((0, 1))
+        with patch.object(warmup.random, "choice", side_effect=lambda items: items[next(indexes)]):
+            warmup.start_task(task_id, now_epoch=START_EPOCH)
+
+        scheduled = q_all("""
+            SELECT html_file, subject_template, from_name FROM scheduled_email_tasks
+            WHERE task_id=? ORDER BY warmup_due_epoch
+        """, (task_id,))
+        self.assertEqual(
+            [(row["subject_template"], row["from_name"]) for row in scheduled],
+            [("Alpha {{code8}}", "Alpha Sender"),
+             ("Beta {{code8}}", "Beta Sender")],
+        )
+        payloads = []
+        def fake_post(*_args, **kwargs):
+            payloads.append(kwargs["json"])
+            return SimpleNamespace(status_code=202, headers={"X-Message-Id": "test"}, text="")
+
+        with patch.object(services.requests, "post", side_effect=fake_post):
+            warmup.process_due_tasks(10, now_epoch=START_EPOCH)
+            warmup.process_due_tasks(10, now_epoch=START_EPOCH + 1)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual([payload["from"]["name"] for payload in payloads],
+                         ["Alpha Sender", "Beta Sender"])
+        self.assertTrue(payloads[0]["subject"].startswith("Alpha "))
+        self.assertTrue(payloads[1]["subject"].startswith("Beta "))
+        self.assertIn("ALPHA alpha@example.com", payloads[0]["content"][0]["value"])
+        self.assertIn("BETA beta@example.com", payloads[1]["content"][0]["value"])
+
+    def test_pending_template_snapshot_survives_edit(self):
+        group_id = services.upload_template_group(
+            self.tag, "snapshot HTML", [("notice.html", b"<p>Original {{to_email}}</p>")],
+            "Original subject", "Original Sender",
+        )
+        list_id = self.add_list("first@example.com")
+        task_id = self.create_task([1], lists=[list_id], group_id=group_id)
+        warmup.start_task(task_id, now_epoch=START_EPOCH)
+        pending_file = self.rows(task_id)[0]["html_file"]
+        file_id = q_one("SELECT id FROM template_files WHERE group_id=?", (group_id,))["id"]
+        services.update_template_file_content(
+            file_id, "<p>Revised {{to_email}}</p>",
+            "Revised subject", "Revised Sender",
+        )
+        current_file = q_one("SELECT file_path FROM template_files WHERE id=?", (file_id,))["file_path"]
+        self.assertNotEqual(pending_file, current_file)
+
+        payloads = []
+        def fake_post(*_args, **kwargs):
+            payloads.append(kwargs["json"])
+            return SimpleNamespace(status_code=202, headers={"X-Message-Id": "test"}, text="")
+
+        with patch.object(services.requests, "post", side_effect=fake_post):
+            warmup.process_due_tasks(1, now_epoch=START_EPOCH)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["subject"], "Original subject")
+        self.assertEqual(payloads[0]["from"]["name"], "Original Sender")
+        self.assertIn("Original first@example.com", payloads[0]["content"][0]["value"])
+
+        next_list = self.add_list("next@example.com")
+        next_task = self.create_task([1], lists=[next_list], group_id=group_id)
+        warmup.start_task(next_task, now_epoch=START_EPOCH + DAY)
+        with patch.object(services.requests, "post", side_effect=fake_post):
+            warmup.process_due_tasks(1, now_epoch=START_EPOCH + DAY)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[1]["subject"], "Revised subject")
+        self.assertEqual(payloads[1]["from"]["name"], "Revised Sender")
+        self.assertIn("Revised next@example.com", payloads[1]["content"][0]["value"])
+
+    def test_missing_html_before_post_fails_without_holding_a_recipient(self):
+        list_id = self.add_list("missing-template@example.com")
+        task_id = self.create_task([1], lists=[list_id])
+        warmup.start_task(task_id, now_epoch=START_EPOCH)
+        planned = self.rows(task_id)[0]
+        Path(planned["html_file"]).unlink()
+
+        with patch.object(services.requests, "post") as post:
+            warmup.process_due_tasks(1, now_epoch=START_EPOCH)
+            post.assert_not_called()
+        self.assertEqual(self.rows(task_id)[0]["status"], "failed")
+        self.assertEqual(q_one(
+            "SELECT status FROM recipient_pool WHERE id=?", (planned["recipient_pool_id"],)
+        )["status"], "available")
+        self.assertEqual(q_one(
+            "SELECT COALESCE(SUM(reserved_count),0) AS n FROM channel_daily_stats WHERE channel_id=?",
+            (self.channel,),
+        )["n"], 0)
+
+    def test_failed_multifile_template_upload_leaves_no_group_or_file(self):
+        base = Path(self.env["TEMPLATE_STORAGE_DIR"])
+        before_groups = q_one("SELECT COUNT(*) AS c FROM template_groups")["c"]
+        before_files = {path for path in base.rglob("*") if path.is_file()}
+        with self.assertRaises(ValueError):
+            services.upload_template_group(
+                self.tag, "partial upload", [
+                    ("first.html", b"<p>Valid</p>"),
+                    ("second.txt", b"not an HTML file"),
+                ], "Subject", "Sender",
+            )
+        self.assertEqual(q_one("SELECT COUNT(*) AS c FROM template_groups")["c"], before_groups)
+        self.assertEqual({path for path in base.rglob("*") if path.is_file()}, before_files)
+
+    def test_old_template_schema_upgrades_idempotently_and_keeps_legacy_fallback(self):
+        pending_list = self.add_list("pending-before-upgrade@example.com")
+        pending_task = self.create_task([1], lists=[pending_list], group_id=self.group)
+        warmup.start_task(pending_task, now_epoch=START_EPOCH)
+        pending_before = q_one(
+            "SELECT id,recipient_pool_id,html_file,subject_template,from_name,"
+            "warmup_due_epoch,status FROM scheduled_email_tasks WHERE task_id=?",
+            (pending_task,),
+        )
+        original = q_one("SELECT * FROM template_files WHERE group_id=?", (self.group,))
+        conn = get_conn()
+        try:
+            conn.execute("DROP TABLE template_files")
+            conn.execute("""
+                CREATE TABLE template_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    has_unsubscribe INTEGER DEFAULT 0,
+                    created_at TEXT
+                )
+            """)
+            conn.execute("""
+                INSERT INTO template_files
+                    (id, group_id, filename, file_path, has_unsubscribe, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (original["id"], original["group_id"], original["filename"],
+                  original["file_path"], original["has_unsubscribe"], original["created_at"]))
+            conn.commit()
+        finally:
+            conn.close()
+        init_db()
+        init_db()
+        upgraded = q_one("SELECT * FROM template_files WHERE id=?", (original["id"],))
+        self.assertIsNone(upgraded["subject_template"])
+        self.assertIsNone(upgraded["from_name"])
+        self.assertEqual(upgraded["file_path"], original["file_path"])
+        self.assertEqual(q_one(
+            "SELECT id,recipient_pool_id,html_file,subject_template,from_name,"
+            "warmup_due_epoch,status FROM scheduled_email_tasks WHERE task_id=?",
+            (pending_task,),
+        ), pending_before)
+
+        list_id = self.add_list("legacy@example.com")
+        task_id = self.create_task([1], lists=[list_id], group_id=self.group)
+        warmup.start_task(task_id, now_epoch=START_EPOCH)
+        scheduled = q_one("SELECT * FROM scheduled_email_tasks WHERE task_id=?", (task_id,))
+        self.assertEqual(scheduled["subject_template"], "Hello {{to_email}}")
+        self.assertEqual(scheduled["from_name"], "Test Sender")
 
     def test_failed_allocation_rolls_back_and_validates_list_ownership(self):
         list_id = self.add_list("a@example.com", "b@example.com")

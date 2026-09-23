@@ -6,6 +6,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 _TEST_DIR = Path(tempfile.mkdtemp(prefix="sendgrid-web-tests-"))
 os.environ["DATABASE_PATH"] = str(_TEST_DIR / "test.db")
@@ -19,7 +20,7 @@ os.environ["STORE_SEND_REQUEST_BODY"] = "false"
 os.environ["WORKER_CLAIM_TIMEOUT_SECONDS"] = "60"
 os.environ["REQUEST_TIMEOUT_SECONDS"] = "5"
 
-from app import services  # noqa: E402
+from app import services, warmup  # noqa: E402
 from app.crypto import protect, unprotect  # noqa: E402
 from app.db import execute, get_conn, init_db, q_all, q_one  # noqa: E402
 
@@ -76,8 +77,7 @@ class ReliabilityTests(unittest.TestCase):
             conn.close()
 
     def seed_plan_pool(self, tag_id, prefix, daily_limit=2):
-        self.add_pool(tag_id, services.POOL_0_3, prefix + "-early", daily_limit * 3)
-        self.add_pool(tag_id, services.POOL_4_30, prefix + "-late", daily_limit * 27)
+        self.add_pool(tag_id, services.POOL_UNIFIED, prefix, daily_limit * 30)
 
     def test_concurrent_generation_is_atomic_and_capacity_aware(self):
         tag_id = services.create_tag("concurrent", "transactional", "")
@@ -90,8 +90,7 @@ class ReliabilityTests(unittest.TestCase):
             tag_id, "concurrent-2", "SG.two", "two@example.com", "Two", None, 2
         )
         # Two plans need 120 unique addresses in total.
-        self.add_pool(tag_id, services.POOL_0_3, "concurrent-early", 12)
-        self.add_pool(tag_id, services.POOL_4_30, "concurrent-late", 108)
+        self.add_pool(tag_id, services.POOL_UNIFIED, "concurrent", 120)
         task_1 = services.create_mail_task(tag_id, channel_1, "task-1", "Hello", group_id)
         task_2 = services.create_mail_task(tag_id, channel_2, "task-2", "Hello", group_id)
 
@@ -173,7 +172,7 @@ class ReliabilityTests(unittest.TestCase):
         ]
         self.assertEqual(after_ids, before_ids)
 
-    def test_stale_claim_releases_daily_slot(self):
+    def test_stale_claim_requires_review_and_keeps_daily_slot(self):
         tag_id, channel_id, group_id = self.create_resources("stale", daily_limit=1)
         self.seed_plan_pool(tag_id, "stale", daily_limit=1)
         task_id = services.create_mail_task(tag_id, channel_id, "stale-task", "Hello", group_id)
@@ -183,14 +182,15 @@ class ReliabilityTests(unittest.TestCase):
             (task_id,),
         )["id"]
         worker_id = "dead-worker"
-        old_claim = (datetime.now() - timedelta(minutes=10)).isoformat(timespec="seconds")
+        old_claim_time = datetime.now() - timedelta(minutes=10)
+        old_claim = old_claim_time.isoformat(timespec="seconds")
         execute(
             """
             UPDATE scheduled_email_tasks
-            SET status='sending', claimed_at=?, worker_id=?
+            SET status='sending', claimed_at=?, claimed_epoch=?, worker_id=?
             WHERE id=?
             """,
-            (old_claim, worker_id, scheduled_id),
+            (old_claim, int(old_claim_time.timestamp()), worker_id, scheduled_id),
         )
         slot_date = services._reserve_channel_slot(channel_id, 1, scheduled_id, worker_id)
         self.assertIsNotNone(slot_date)
@@ -204,14 +204,14 @@ class ReliabilityTests(unittest.TestCase):
 
         self.assertEqual(services._recover_stale_sending_claims(), 1)
         row = q_one("SELECT status, channel_slot_date FROM scheduled_email_tasks WHERE id=?", (scheduled_id,))
-        self.assertEqual(row["status"], "pending")
-        self.assertIsNone(row["channel_slot_date"])
+        self.assertEqual(row["status"], "needs_review")
+        self.assertEqual(row["channel_slot_date"], slot_date)
         self.assertEqual(
             q_one(
                 "SELECT reserved_count FROM channel_daily_stats WHERE channel_id=? AND date=?",
                 (channel_id, slot_date),
             )["reserved_count"],
-            0,
+            1,
         )
 
     def test_logged_provider_acceptance_is_not_resent_after_worker_crash(self):
@@ -296,31 +296,77 @@ class ReliabilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             services.update_user(admin["id"], "Admin", "member", "active")
 
+    def test_channel_referenced_by_task_cannot_change_tag(self):
+        tag_id, channel_id, group_id = self.create_resources("channel-tag-guard")
+        other_tag = services.create_tag("channel-other-tag", "transactional", "")
+        task_id = services.create_mail_task(
+            tag_id, channel_id, "referencing-draft", "Hello", group_id
+        )
+        before = q_one("SELECT * FROM send_channels WHERE id=?", (channel_id,))
+
+        with self.assertRaises(ValueError):
+            services.update_channel(
+                channel_id, other_tag, "moved-channel", "", before["from_email"],
+                before["from_name"], before["proxy_id"], before["daily_limit"], "active",
+            )
+        self.assertEqual(q_one("SELECT * FROM send_channels WHERE id=?", (channel_id,)), before)
+        self.assertEqual(q_one("SELECT tag_id FROM mail_tasks WHERE id=?", (task_id,))["tag_id"],
+                         tag_id)
+
+    def test_inactive_bound_proxy_blocks_http_post_instead_of_direct_send(self):
+        tag_id = services.create_tag("inactive-proxy-tag", "transactional", "")
+        proxy_id = services.create_proxy("inactive-proxy", "http://127.0.0.1:3128")
+        channel_id = services.create_channel(
+            tag_id, "proxied-channel", "SG.fake", "sender@example.com", "Sender",
+            proxy_id, 10,
+        )
+        group_id = services.create_template_group(tag_id, "proxied-template")
+        services.save_template_file(group_id, "notice.html", self.template_file)
+        imported = warmup.import_named_list(
+            tag_id, "proxied-list", "Website opt-in", "2026-09-22T10:00:00+00:00",
+            b"proxied@example.com",
+        )
+        task_id = warmup.create_task(
+            tag_id, channel_id, "proxied-task", "Hello", group_id,
+            [1], "manual", 60, [], [imported["id"]], True,
+        )
+        warmup.start_task(task_id, now_epoch=int(datetime.now().timestamp()))
+        scheduled = q_one("SELECT * FROM scheduled_email_tasks WHERE task_id=?", (task_id,))
+        execute("UPDATE proxies SET status='disabled' WHERE id=?", (proxy_id,))
+
+        with patch.object(services.requests, "post") as post:
+            ok, message_id, error, outcome = services._send_via_sendgrid(scheduled)
+            post.assert_not_called()
+        self.assertFalse(ok)
+        self.assertIsNone(message_id)
+        self.assertIn("proxy", error.lower())
+        self.assertEqual(outcome, "NOT_SENT")
+
     def test_recipient_pool_edit_delete_search_and_usage_guards(self):
         source_tag = services.create_tag("recipient-source", "transactional", "")
         target_tag = services.create_tag("recipient-target", "transactional", "")
-        self.add_pool(source_tag, services.POOL_0_3, "editable", 3)
+        self.add_pool(source_tag, services.POOL_UNIFIED, "editable", 3)
         editable = q_one(
             "SELECT * FROM recipient_pool WHERE tag_id=? AND pool_type=? ORDER BY id LIMIT 1",
-            (source_tag, services.POOL_0_3),
+            (source_tag, services.POOL_UNIFIED),
         )
 
         services.update_recipient_pool_entry(
             editable["id"],
             target_tag,
-            services.POOL_4_30,
+            services.POOL_UNIFIED,
             "renamed@example.com",
             "Renamed User",
             "manual correction",
         )
         updated = q_one("SELECT * FROM recipient_pool WHERE id=?", (editable["id"],))
         self.assertEqual(updated["tag_id"], target_tag)
-        self.assertEqual(updated["pool_type"], services.POOL_4_30)
+        self.assertEqual(updated["pool_type"], services.POOL_UNIFIED)
         self.assertEqual(updated["email"], "renamed@example.com")
 
         result = services.get_recipient_pool_rows(
             target_tag,
-            services.POOL_4_30,
+            services.POOL_UNIFIED,
             search="manual correction",
             page=1,
             page_size=10,
@@ -368,18 +414,154 @@ class ReliabilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             services.delete_recipient_pool_entry(used["id"])
 
-        self.add_pool(tag_id, services.POOL_0_3, "bulk-extra", 2)
+        self.add_pool(tag_id, services.POOL_UNIFIED, "bulk-extra", 2)
         before_used = q_one(
             "SELECT COUNT(*) AS c FROM recipient_pool WHERE tag_id=? AND pool_type=? AND status='reserved'",
-            (tag_id, services.POOL_0_3),
+            (tag_id, services.POOL_UNIFIED),
         )["c"]
-        deleted = services.delete_available_recipient_pool(tag_id, services.POOL_0_3)["deleted"]
+        deleted = services.delete_available_recipient_pool(tag_id, services.POOL_UNIFIED)["deleted"]
         self.assertEqual(deleted, 2)
         after_used = q_one(
             "SELECT COUNT(*) AS c FROM recipient_pool WHERE tag_id=? AND pool_type=? AND status='reserved'",
-            (tag_id, services.POOL_0_3),
+            (tag_id, services.POOL_UNIFIED),
         )["c"]
         self.assertEqual(after_used, before_used)
+
+    def test_new_pool_import_reuses_address_from_legacy_type(self):
+        tag_id = services.create_tag("merged-import", "transactional", "")
+        self.add_pool(tag_id, services.POOL_0_3, "historical", 1)
+        address = "historical-0@example.com"
+        original = q_one(
+            "SELECT id FROM recipient_pool WHERE tag_id=? AND email=?",
+            (tag_id, address),
+        )["id"]
+        result = services.import_recipient_pool(
+            tag_id, services.POOL_UNIFIED, "new upload",
+            (address.upper() + "\nnew@example.com").encode("utf-8"),
+        )
+        self.assertEqual(result["imported"], 1)
+        rows = q_all(
+            "SELECT id, email, pool_type FROM recipient_pool WHERE tag_id=? ORDER BY id",
+            (tag_id,),
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], original)
+        self.assertEqual(rows[1]["pool_type"], services.POOL_UNIFIED)
+
+    def test_legacy_draft_rejects_only_unconsented_or_disabled_named_rows(self):
+        for case in ("no_consent_record", "disabled_list"):
+            with self.subTest(case=case):
+                tag_id, channel_id, group_id = self.create_resources(case, daily_limit=1)
+                addresses = ["{}-{}@example.com".format(case, n) for n in range(30)]
+                if case == "no_consent_record":
+                    self.add_pool(tag_id, "warmup_named", case, 30)
+                else:
+                    result = warmup.import_named_list(
+                        tag_id, "historical consenting list", "Website opt-in",
+                        "2026-09-22T10:00:00+00:00", "\n".join(addresses).encode("utf-8"),
+                    )
+                    # This type is how named-list members existed before the
+                    # unified pool; their membership must still be checked.
+                    execute("UPDATE recipient_pool SET pool_type='warmup_named' WHERE tag_id=?",
+                            (tag_id,))
+                    warmup.disable_named_list(result["id"])
+
+                task_id = services.create_mail_task(
+                    tag_id, channel_id, case, "Hello", group_id
+                )
+                with self.assertRaises(ValueError):
+                    services.generate_plan(task_id)
+                self.assertEqual(q_one(
+                    "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=?", (task_id,)
+                )["c"], 0)
+
+    def test_legacy_pending_named_member_is_skipped_after_list_is_disabled(self):
+        tag_id, channel_id, group_id = self.create_resources("disabled-after-plan", daily_limit=1)
+        addresses = ["old-list-{}@example.com".format(n) for n in range(30)]
+        result = warmup.import_named_list(
+            tag_id, "historical list", "Website opt-in",
+            "2026-09-22T10:00:00+00:00", "\n".join(addresses).encode("utf-8"),
+        )
+        execute("UPDATE recipient_pool SET pool_type='warmup_named' WHERE tag_id=?", (tag_id,))
+        task_id = services.create_mail_task(
+            tag_id, channel_id, "historical plan", "Hello", group_id
+        )
+        services.generate_plan(task_id)
+        services.start_task(task_id)
+        planned = q_one(
+            "SELECT id,recipient_pool_id FROM scheduled_email_tasks WHERE task_id=? ORDER BY id LIMIT 1",
+            (task_id,),
+        )
+        execute("UPDATE scheduled_email_tasks SET scheduled_at='2999-01-01T00:00:00' WHERE task_id=?",
+                (task_id,))
+        execute("UPDATE scheduled_email_tasks SET scheduled_at=? WHERE id=?",
+                ((datetime.now() - timedelta(seconds=10)).isoformat(timespec="seconds"), planned["id"]))
+        warmup.disable_named_list(result["id"])
+
+        with patch.object(services.requests, "post") as sender:
+            services.process_due_tasks(1)
+            sender.assert_not_called()
+        self.assertEqual(q_one(
+            "SELECT status FROM scheduled_email_tasks WHERE id=?", (planned["id"],)
+        )["status"], "missed")
+        self.assertEqual(q_one(
+            "SELECT status FROM recipient_pool WHERE id=?", (planned["recipient_pool_id"],)
+        )["status"], "available")
+        self.assertEqual(q_one(
+            "SELECT COUNT(*) AS c FROM send_log WHERE scheduled_task_id=?", (planned["id"],)
+        )["c"], 0)
+
+    def test_legacy_ambiguous_post_is_reviewed_then_reconciled_once(self):
+        tag_id, channel_id, group_id = self.create_resources("ambiguous", daily_limit=1)
+        self.seed_plan_pool(tag_id, "ambiguous", daily_limit=1)
+        task_id = services.create_mail_task(tag_id, channel_id, "legacy-ambiguous", "Hello", group_id)
+        services.generate_plan(task_id)
+        services.start_task(task_id)
+        scheduled = q_one(
+            "SELECT id, recipient_pool_id FROM scheduled_email_tasks WHERE task_id=? ORDER BY id LIMIT 1",
+            (task_id,),
+        )
+        execute("UPDATE scheduled_email_tasks SET scheduled_at='2999-01-01T00:00:00' WHERE task_id=?",
+                (task_id,))
+        execute("UPDATE scheduled_email_tasks SET scheduled_at=? WHERE id=?",
+                ((datetime.now() - timedelta(seconds=10)).isoformat(timespec="seconds"), scheduled["id"]))
+
+        with patch.object(
+            services.requests, "post",
+            side_effect=services.requests.exceptions.ReadTimeout("response lost after POST"),
+        ) as sender:
+            services.process_due_tasks(1)
+            services.process_due_tasks(1)
+            self.assertEqual(sender.call_count, 1)
+
+        row = q_one("SELECT status,channel_slot_date FROM scheduled_email_tasks WHERE id=?",
+                    (scheduled["id"],))
+        self.assertEqual(row["status"], "needs_review")
+        self.assertIsNotNone(row["channel_slot_date"])
+        self.assertEqual(q_one(
+            "SELECT status FROM recipient_pool WHERE id=?", (scheduled["recipient_pool_id"],)
+        )["status"], "reserved")
+        before = q_one(
+            "SELECT sent_count,reserved_count FROM channel_daily_stats WHERE channel_id=? AND date=?",
+            (channel_id, row["channel_slot_date"]),
+        )
+        self.assertEqual((before["sent_count"], before["reserved_count"]), (0, 1))
+
+        services.resolve_legacy_review(scheduled["id"], "accepted")
+        after = q_one(
+            "SELECT sent_count,reserved_count FROM channel_daily_stats WHERE channel_id=? AND date=?",
+            (channel_id, row["channel_slot_date"]),
+        )
+        self.assertEqual((after["sent_count"], after["reserved_count"]), (1, 0))
+        self.assertEqual(q_one(
+            "SELECT status FROM recipient_pool WHERE id=?", (scheduled["recipient_pool_id"],)
+        )["status"], "sent")
+        with self.assertRaises(ValueError):
+            services.resolve_legacy_review(scheduled["id"], "accepted")
+        self.assertEqual(q_one(
+            "SELECT sent_count,reserved_count FROM channel_daily_stats WHERE channel_id=? AND date=?",
+            (channel_id, row["channel_slot_date"]),
+        ), after)
 
 
 if __name__ == "__main__":

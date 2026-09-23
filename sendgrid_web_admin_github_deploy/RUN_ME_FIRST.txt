@@ -7,12 +7,17 @@
 3. Double click start_web_admin.bat
 4. Open http://127.0.0.1:8080
 5. Login as admin, then open 团队成员 to add team members.
-6. Open 收件人池/库 and upload one or multiple TXT/CSV recipient files into:
-   - 0-3天库 for day 1, day 2 and day 3
-   - 4-30天库 for day 4 through day 30
-7. Create a task. You no longer select recipient lists in the task form.
-8. Click 生成计划. The system automatically takes recipients from the two pools.
-9. If the pool is insufficient, the page will show a popup alert and will not create the plan.
+6. Open 收件人 and upload one or multiple TXT/CSV files to the single recipient pool.
+   Named lists are filters of this pool, not additional pools.
+7. Open HTML 模板. Enter a subject and sender display name when uploading HTML
+   files. The values are bound to every file in that upload and can then be
+   edited per file. The sender email address comes from the selected API channel.
+8. Create a fixed 30-day task or a custom warm-up task and select a template group.
+   A custom warm-up task may use the full pool or a named-list filter.
+9. Generate or start the plan. The system reserves eligible recipients from the
+   single pool. If stock is insufficient, it does not create a partial plan.
+10. Existing tasks, scheduled messages and send history remain available after upgrade.
+    Old template files without bindings use the task subject and channel sender name.
 
 Warm-up speed:
 Day 1 <= 60, actual 45-60
@@ -22,4 +27,5 @@ Day 4-30 <= 1000/day, actual 985-1000/day
 
 Recipient pool upload supports multi-file selection with configurable safety limits.
 
-Detailed reliability/security changes: OPTIMIZATION_NOTES.md
+Current warm-up details: WARMUP_GUIDE.md
+Historical v3.2 reliability/security notes: OPTIMIZATION_NOTES.md

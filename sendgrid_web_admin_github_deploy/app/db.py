@@ -164,10 +164,17 @@ def init_db():
             group_id INTEGER NOT NULL,
             filename TEXT NOT NULL,
             file_path TEXT NOT NULL,
+            subject_template TEXT,
+            from_name TEXT,
             has_unsubscribe INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
+    template_file_cols = {row[1] for row in cur.execute("PRAGMA table_info(template_files)").fetchall()}
+    if "subject_template" not in template_file_cols:
+        cur.execute("ALTER TABLE template_files ADD COLUMN subject_template TEXT")
+    if "from_name" not in template_file_cols:
+        cur.execute("ALTER TABLE template_files ADD COLUMN from_name TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS mail_tasks (
@@ -288,6 +295,7 @@ def init_db():
             recipient_pool_id INTEGER,
             recipient_pool_type TEXT,
             claimed_at TEXT,
+            claimed_epoch INTEGER,
             worker_id TEXT,
             channel_slot_date TEXT
         )
@@ -300,6 +308,8 @@ def init_db():
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN recipient_pool_type TEXT")
     if "claimed_at" not in scheduled_cols:
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN claimed_at TEXT")
+    if "claimed_epoch" not in scheduled_cols:
+        cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN claimed_epoch INTEGER")
     if "worker_id" not in scheduled_cols:
         cur.execute("ALTER TABLE scheduled_email_tasks ADD COLUMN worker_id TEXT")
     if "channel_slot_date" not in scheduled_cols:

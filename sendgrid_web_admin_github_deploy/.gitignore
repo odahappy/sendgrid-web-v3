@@ -9,11 +9,20 @@ ENV/
 
 # Runtime data
 .env
+.env.*
+!/.env.example
+!/.env.vps.example
 *.db
+*.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 data/
 logs/
+backups/
+uploads/*
+!uploads/templates/
 uploads/templates/*
 !uploads/templates/.gitkeep
 

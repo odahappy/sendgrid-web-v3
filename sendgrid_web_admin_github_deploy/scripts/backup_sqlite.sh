@@ -18,8 +18,9 @@ if [ ! -f "$DB_PATH" ]; then
   exit 1
 fi
 
-TS="$(date +%Y%m%d_%H%M%S)"
+TS="$(date +%Y%m%d_%H%M%S)_$$"
 OUT="$BACKUP_DIR/web_admin_scheduler_${TS}.db"
+UPLOADS_OUT="$BACKUP_DIR/uploads_${TS}.tar.gz"
 
 # SQLite's backup API produces a transactionally consistent copy even in WAL mode.
 python3 - "$DB_PATH" "$OUT" <<'PY'
@@ -36,7 +37,14 @@ finally:
     source.close()
 PY
 
-tar -czf "$BACKUP_DIR/uploads_${TS}.tar.gz" uploads 2>/dev/null || true
-
 echo "Database backup: $OUT"
-echo "Uploads backup: $BACKUP_DIR/uploads_${TS}.tar.gz"
+if [ -d uploads ]; then
+  if ! tar -czf "$UPLOADS_OUT" uploads; then
+    rm -f "$UPLOADS_OUT"
+    echo "ERROR: Uploads backup failed. Database backup remains at $OUT" >&2
+    exit 1
+  fi
+  echo "Uploads backup: $UPLOADS_OUT"
+else
+  echo "Uploads backup skipped: uploads/ does not exist."
+fi

@@ -6,6 +6,7 @@ import hmac
 import shutil
 import sqlite3
 import uuid
+import unicodedata
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -284,22 +285,35 @@ def create_channel(tag_id, name, api_key, from_email, from_name, proxy_id, daily
 
 
 def update_channel(channel_id, tag_id, name, api_key, from_email, from_name, proxy_id, daily_limit, status):
-    if api_key and api_key.strip():
-        execute("""
-            UPDATE send_channels
-            SET tag_id=?, name=?, api_key_protected=?, from_email=?, from_name=?,
-                proxy_id=?, daily_limit=?, status=?, updated_at=?
-            WHERE id=?
-        """, (tag_id, name, protect(api_key.strip()), from_email, from_name, proxy_id if proxy_id else None,
-              daily_limit, status, now_iso(), channel_id))
-    else:
-        execute("""
-            UPDATE send_channels
-            SET tag_id=?, name=?, from_email=?, from_name=?,
-                proxy_id=?, daily_limit=?, status=?, updated_at=?
-            WHERE id=?
-        """, (tag_id, name, from_email, from_name, proxy_id if proxy_id else None,
-              daily_limit, status, now_iso(), channel_id))
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        channel = conn.execute("SELECT tag_id FROM send_channels WHERE id=?", (channel_id,)).fetchone()
+        if not channel:
+            raise ValueError("通道不存在。")
+        if not conn.execute("SELECT 1 FROM tags WHERE id=?", (tag_id,)).fetchone():
+            raise ValueError("标签不存在。")
+        if int(channel["tag_id"]) != int(tag_id) and conn.execute("""
+            SELECT 1 FROM mail_tasks WHERE channel_id=? LIMIT 1
+        """, (channel_id,)).fetchone():
+            raise ValueError("通道已被任务使用，不能更改所属标签。")
+        values = [tag_id, name, from_email, from_name, proxy_id if proxy_id else None,
+                  daily_limit, status, now_iso()]
+        key_clause = ""
+        if api_key and api_key.strip():
+            key_clause = ", api_key_protected=?"
+            values.append(protect(api_key.strip()))
+        values.append(channel_id)
+        conn.execute("""
+            UPDATE send_channels SET tag_id=?,name=?,from_email=?,from_name=?,
+                proxy_id=?,daily_limit=?,status=?,updated_at=?{} WHERE id=?
+        """.format(key_clause), tuple(values))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def create_recipient_list(tag_id, name, list_group):
@@ -343,11 +357,34 @@ def create_template_group(tag_id, name):
 
 def update_template_group(group_id, tag_id, name, status):
     status = status if status in ("active", "paused", "disabled") else "active"
-    return execute_rowcount("""
-        UPDATE template_groups
-        SET tag_id=?, name=?, status=?, updated_at=?
-        WHERE id=?
-    """, (tag_id, name, status, now_iso(), group_id))
+    name = (name or "").strip()
+    if not name or len(name) > 180:
+        raise ValueError("请填写有效的模板组名称（最多 180 个字符）。")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        group = conn.execute("SELECT tag_id FROM template_groups WHERE id=?", (group_id,)).fetchone()
+        if not group:
+            raise ValueError("模板组不存在。")
+        tag = conn.execute("SELECT id FROM tags WHERE id=?", (tag_id,)).fetchone()
+        if not tag:
+            raise ValueError("标签不存在。")
+        if int(group["tag_id"]) != int(tag_id):
+            used = conn.execute(
+                "SELECT 1 FROM mail_tasks WHERE template_group_id=? LIMIT 1", (group_id,)
+            ).fetchone()
+            if used:
+                raise ValueError("模板组已被任务使用，不能更改所属标签。")
+        cursor = conn.execute("""
+            UPDATE template_groups SET tag_id=?, name=?, status=?, updated_at=? WHERE id=?
+        """, (tag_id, name, status, now_iso(), group_id))
+        conn.commit()
+        return cursor.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def delete_template_group(group_id):
@@ -366,21 +403,135 @@ def delete_template_group(group_id):
     return deleted
 
 
-def save_template_file(group_id, filename, content_bytes):
-    settings = get_settings()
-    safe_name = (filename or "template.html").replace("\\", "_").replace("/", "_")[:180]
-    folder = Path(settings.template_storage_dir) / str(group_id)
-    folder.mkdir(parents=True, exist_ok=True)
-    # Keep the display filename, but use a unique storage name so repeated
-    # uploads never overwrite an older template file.
+def validate_template_metadata(subject_template, from_name):
+    """Validate the two mail headers associated with one HTML template file."""
+    values = []
+    for raw, label, maximum in (
+        (subject_template, "邮件主题", 500),
+        (from_name, "发件人名称", 180),
+    ):
+        value = "" if raw is None else str(raw)
+        if any(unicodedata.category(char) == "Cc" or char in "\u2028\u2029" for char in value):
+            raise ValueError("{}不能包含换行或控制字符。".format(label))
+        value = value.strip()
+        if not value or len(value) > maximum:
+            raise ValueError("请填写有效的{}（最多 {} 个字符）。".format(label, maximum))
+        values.append(value)
+    return tuple(values)
+
+
+def _template_file_data(filename, content_bytes):
+    safe_name = (filename or "").strip()
+    safe_name = "".join("_" if char in '<>:"/\\|?*' or ord(char) < 32 else char
+                        for char in safe_name)[:180]
+    if not safe_name or Path(safe_name).suffix.lower() not in (".html", ".htm"):
+        raise ValueError("仅支持非空的 HTML/HTM 模板文件。")
+    if not isinstance(content_bytes, bytes) or not content_bytes:
+        raise ValueError("HTML 模板文件不能为空。")
+    if len(content_bytes) > get_settings().max_template_upload_bytes:
+        raise ValueError("HTML 模板文件超过上传大小限制。")
+    try:
+        text = content_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("HTML 模板文件必须使用 UTF-8 编码。") from exc
+    has_unsub = int("unsubscribe" in text.lower() or "退订" in text)
+    return safe_name, content_bytes, has_unsub
+
+
+def _insert_template_file(cur, folder, group_id, file_data, subject_template, from_name):
+    safe_name, content_bytes, has_unsub = file_data
+    # A new path preserves the bytes referenced by already scheduled messages.
     path = folder / (uuid.uuid4().hex + "_" + safe_name)
-    path.write_bytes(content_bytes)
-    text = content_bytes.decode("utf-8", errors="ignore").lower()
-    has_unsub = 1 if ("unsubscribe" in text or "退订" in text) else 0
-    return execute("""
-        INSERT INTO template_files (group_id, filename, file_path, has_unsubscribe, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (group_id, safe_name, str(path), has_unsub, now_iso()))
+    try:
+        path.write_bytes(content_bytes)
+        cursor = cur.execute("""
+            INSERT INTO template_files
+                (group_id, filename, file_path, subject_template, from_name,
+                 has_unsubscribe, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (group_id, safe_name, str(path), subject_template, from_name,
+              has_unsub, now_iso()))
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return cursor.lastrowid, path
+
+
+def upload_template_group(tag_id, name, files, subject_template, from_name):
+    """Store a whole multi-file upload or leave neither rows nor files behind."""
+    subject_template, from_name = validate_template_metadata(subject_template, from_name)
+    name = (name or "").strip()
+    if not name or len(name) > 180:
+        raise ValueError("请填写有效的模板组名称（最多 180 个字符）。")
+    settings = get_settings()
+    files = list(files)
+    if not files or len(files) > settings.max_template_files_per_upload:
+        raise ValueError("HTML 模板文件数量不符合上传限制。")
+    prepared = [_template_file_data(filename, content) for filename, content in files]
+    conn = get_conn()
+    created_paths = []
+    folder = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        tag = conn.execute("SELECT id, status FROM tags WHERE id=?", (tag_id,)).fetchone()
+        if not tag or tag["status"] != "active":
+            raise ValueError("请选择有效且启用的标签。")
+        stamp = now_iso()
+        cursor = conn.execute("""
+            INSERT INTO template_groups (tag_id, name, status, created_at, updated_at)
+            VALUES (?, ?, 'active', ?, ?)
+        """, (tag_id, name, stamp, stamp))
+        group_id = cursor.lastrowid
+        folder = Path(settings.template_storage_dir) / str(group_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        for item in prepared:
+            _, path = _insert_template_file(
+                conn, folder, group_id, item, subject_template, from_name
+            )
+            created_paths.append(path)
+        conn.commit()
+        return group_id
+    except Exception:
+        conn.rollback()
+        for path in created_paths:
+            path.unlink(missing_ok=True)
+        if folder is not None:
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+        raise
+    finally:
+        conn.close()
+
+
+def save_template_file(group_id, filename, content_bytes, subject_template=None, from_name=None):
+    """Backward compatible single-file importer, including legacy NULL metadata."""
+    if (subject_template is None) != (from_name is None):
+        raise ValueError("邮件主题和发件人名称必须同时填写。")
+    if subject_template is not None:
+        subject_template, from_name = validate_template_metadata(subject_template, from_name)
+    file_data = _template_file_data(filename, content_bytes)
+    conn = get_conn()
+    path = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM template_groups WHERE id=?", (group_id,)).fetchone():
+            raise ValueError("模板组不存在。")
+        folder = Path(get_settings().template_storage_dir) / str(group_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        file_id, path = _insert_template_file(
+            conn, folder, group_id, file_data, subject_template, from_name
+        )
+        conn.commit()
+        return file_id
+    except Exception:
+        conn.rollback()
+        if path is not None:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        conn.close()
 
 
 def _read_template_file_for_editor(file_path):
@@ -400,7 +551,8 @@ def get_template_groups_with_files():
     """)
     for group in groups:
         files = q_all("""
-            SELECT id, group_id, filename, file_path, has_unsubscribe, created_at
+            SELECT id, group_id, filename, file_path, subject_template, from_name,
+                   has_unsubscribe, created_at
             FROM template_files
             WHERE group_id=?
             ORDER BY id ASC
@@ -414,32 +566,58 @@ def get_template_groups_with_files():
     return groups
 
 
-def update_template_file_content(file_id, html_content):
-    row = q_one("SELECT * FROM template_files WHERE id=?", (file_id,))
-    if not row:
-        raise ValueError("Template file not found")
-
+def update_template_file_content(file_id, html_content, subject_template=None, from_name=None):
+    """Edit a template without changing HTML already referenced by a schedule."""
+    if (subject_template is None) != (from_name is None):
+        raise ValueError("邮件主题和发件人名称必须同时填写。")
+    if subject_template is not None:
+        subject_template, from_name = validate_template_metadata(subject_template, from_name)
     content = html_content or ""
     content_bytes = content.encode("utf-8")
     max_bytes = get_settings().max_template_upload_bytes
+    if not content_bytes:
+        raise ValueError("HTML 模板内容不能为空。")
     if len(content_bytes) > max_bytes:
         raise ValueError("HTML content is too large. Max allowed is {} bytes.".format(max_bytes))
-
-    path = Path(row["file_path"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-    low = content.lower()
-    has_unsub = 1 if ("unsubscribe" in low or "退订" in low) else 0
-    execute_rowcount("UPDATE template_files SET has_unsubscribe=? WHERE id=?", (has_unsub, file_id))
-    return {"ok": True, "id": file_id, "bytes": len(content_bytes)}
+    conn = get_conn()
+    path = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM template_files WHERE id=?", (file_id,)).fetchone()
+        if not row:
+            raise ValueError("模板文件不存在。")
+        if subject_template is None:
+            subject_template, from_name = row["subject_template"], row["from_name"]
+        folder = Path(row["file_path"]).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / (uuid.uuid4().hex + "_" + row["filename"])
+        path.write_bytes(content_bytes)
+        has_unsub = int("unsubscribe" in content.lower() or "退订" in content)
+        conn.execute("""
+            UPDATE template_files
+            SET file_path=?, subject_template=?, from_name=?, has_unsubscribe=?
+            WHERE id=?
+        """, (str(path), subject_template, from_name, has_unsub, file_id))
+        conn.commit()
+        return {"ok": True, "id": file_id, "bytes": len(content_bytes), "file_path": str(path)}
+    except Exception:
+        conn.rollback()
+        if path is not None:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        conn.close()
 
 
 
 POOL_0_3 = "warmup_0_3"
 POOL_4_30 = "warmup_4_30"
-POOL_TYPES = (POOL_0_3, POOL_4_30)
+POOL_UNIFIED = "unified"
+# Old values remain valid in historical rows and schedules. New uploads only
+# create POOL_UNIFIED rows; the UI presents all three as one logical pool.
+POOL_TYPES = (POOL_UNIFIED,)
 POOL_NAMES = {
+    POOL_UNIFIED: "收件人池",
     POOL_0_3: "0-3天库（第1-3天）",
     POOL_4_30: "4-30天库（第4-30天）",
 }
@@ -451,27 +629,26 @@ def _pool_name(pool_type):
 
 def _normalize_pool_type(pool_type):
     value = (pool_type or "").strip()
-    if value not in POOL_TYPES:
+    if value not in ("", POOL_UNIFIED, POOL_0_3, POOL_4_30, "warmup_named"):
         raise ValueError("Unknown recipient pool type")
-    return value
+    return POOL_UNIFIED
 
 
 def import_recipient_pool(tag_id, pool_type, source_name, content_bytes):
-    """Import recipients into one of the two reusable recipient pools.
+    """Import into the single visible pool, checking all historical pool types.
 
-    The upload-size limit is intentionally not enforced for recipient pools.
-    Duplicate emails inside the same tag + pool are ignored by the UNIQUE index.
+    Keep the pool_type argument for old internal callers; it never selects the
+    destination. A write transaction prevents concurrent imports from adding
+    the same normalized address under different physical pool types.
     """
     pool_type = _normalize_pool_type(pool_type)
-    tag = q_one("SELECT id FROM tags WHERE id=?", (tag_id,))
-    if not tag:
-        raise ValueError("Tag not found")
-
-    text = content_bytes.decode("utf-8", errors="ignore")
+    tag_id = int(tag_id)
+    text = content_bytes.decode("utf-8-sig", errors="ignore")
     source_name = (source_name or "").strip() or _pool_name(pool_type)
     rows = []
     seen = set()
     invalid = 0
+    repeated = 0
     for line in text.splitlines():
         parsed = parse_recipient_line(line)
         if not parsed:
@@ -480,105 +657,103 @@ def import_recipient_pool(tag_id, pool_type, source_name, content_bytes):
             continue
         email, name = parsed
         email_key = email.strip().lower()
-        if not email_key or email_key in seen:
+        if email_key in seen:
+            repeated += 1
             continue
         seen.add(email_key)
-        rows.append((
-            int(tag_id), email_key, name, pool_type, "available",
-            source_name, now_iso(), now_iso(),
-        ))
+        rows.append((email_key, name))
 
-    before = _count(
-        "SELECT COUNT(*) AS c FROM recipient_pool WHERE tag_id=? AND pool_type=?",
-        (tag_id, pool_type),
-    )
-    if rows:
-        execute_many("""
-            INSERT OR IGNORE INTO recipient_pool (
-                tag_id, email, name, pool_type, status, source_name, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-    after = _count(
-        "SELECT COUNT(*) AS c FROM recipient_pool WHERE tag_id=? AND pool_type=?",
-        (tag_id, pool_type),
-    )
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM tags WHERE id=?", (tag_id,)).fetchone():
+            raise ValueError("Tag not found")
+        stamp = now_iso()
+        imported = 0
+        for email_key, name in rows:
+            existing = conn.execute("""
+                SELECT 1 FROM recipient_pool
+                WHERE tag_id=? AND lower(trim(email))=? LIMIT 1
+            """, (tag_id, email_key)).fetchone()
+            if existing:
+                repeated += 1
+                continue
+            conn.execute("""
+                INSERT INTO recipient_pool
+                    (tag_id,email,name,pool_type,status,source_name,created_at,updated_at)
+                VALUES (?,?,?,?,'available',?,?,?)
+            """, (tag_id, email_key, name, POOL_UNIFIED, source_name, stamp, stamp))
+            imported += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return {
         "parsed": len(rows),
-        "imported": max(0, after - before),
-        "duplicates": max(0, len(rows) - max(0, after - before)),
+        "imported": imported,
+        "duplicates": repeated,
         "invalid": invalid,
-        "pool_type": pool_type,
+        "pool_type": POOL_UNIFIED,
     }
 
 
 def get_recipient_pool_stats():
-    """Return tag + pool summaries for the recipient-pool page."""
+    """Return one logical pool per tag, counting each normalized email once."""
     rows = q_all("""
-        SELECT
-            t.id AS tag_id,
-            t.name AS tag_name,
-            p.pool_type,
-            COUNT(p.id) AS total_count,
-            SUM(CASE WHEN p.status='available' THEN 1 ELSE 0 END) AS available_count,
-            SUM(CASE WHEN p.status='reserved' THEN 1 ELSE 0 END) AS reserved_count,
-            SUM(CASE WHEN p.status='sent' THEN 1 ELSE 0 END) AS sent_count,
-            SUM(CASE WHEN p.status='failed' THEN 1 ELSE 0 END) AS failed_count,
-            MAX(p.created_at) AS last_import_at
+        WITH address_flags AS (
+            SELECT tag_id, lower(trim(email)) AS email_key,
+                MAX(p.status='reserved') AS reserved,
+                MAX(p.status='sent') AS sent,
+                MAX(p.status='failed') AS failed,
+                MAX(p.status='available' AND (p.pool_type<>'warmup_named' OR EXISTS (
+                    SELECT 1 FROM recipient_pool_list_members lm
+                    JOIN recipient_lists l ON l.id=lm.list_id
+                    WHERE lm.pool_id=p.id AND l.tag_id=p.tag_id AND l.status='active'
+                      AND l.consent_source IS NOT NULL AND l.consented_at IS NOT NULL
+                ))) AS usable,
+                MAX(p.created_at) AS last_import_at
+            FROM recipient_pool p
+            GROUP BY p.tag_id, lower(trim(p.email))
+        ), addresses AS (
+            SELECT *, CASE
+                WHEN reserved THEN 'reserved'
+                WHEN sent THEN 'sent'
+                WHEN failed THEN 'failed'
+                WHEN usable THEN 'available'
+                ELSE 'unavailable' END AS logical_status
+            FROM address_flags
+        )
+        SELECT t.id AS tag_id, t.name AS tag_name,
+            COUNT(a.email_key) AS total_count,
+            SUM(a.logical_status='available') AS available_count,
+            SUM(a.logical_status='reserved') AS reserved_count,
+            SUM(a.logical_status='sent') AS sent_count,
+            SUM(a.logical_status='failed') AS failed_count,
+            SUM(a.logical_status='unavailable') AS unavailable_count,
+            MAX(a.last_import_at) AS last_import_at
         FROM tags t
-        LEFT JOIN recipient_pool p ON p.tag_id=t.id
-        GROUP BY t.id, p.pool_type
-        ORDER BY t.id DESC, p.pool_type ASC
+        LEFT JOIN addresses a ON a.tag_id=t.id
+        GROUP BY t.id
+        ORDER BY t.id DESC
     """)
-
-    result = []
-    seen = set()
     for row in rows:
-        tag_id = row.get("tag_id")
-        pool_type = row.get("pool_type")
-        if pool_type not in POOL_TYPES:
-            continue
-        seen.add((tag_id, pool_type))
-        row["pool_name"] = _pool_name(pool_type)
-        for key in ("total_count", "available_count", "reserved_count", "sent_count", "failed_count"):
+        row["pool_type"] = POOL_UNIFIED
+        row["pool_name"] = _pool_name(POOL_UNIFIED)
+        for key in ("total_count", "available_count", "reserved_count", "sent_count", "failed_count", "unavailable_count"):
             row[key] = int(row.get(key) or 0)
-        result.append(row)
-
-    # Make every tag show both pools, even when one pool is empty.
-    tags = q_all("SELECT id, name FROM tags ORDER BY id DESC")
-    for tag in tags:
-        for pool_type in POOL_TYPES:
-            if (tag["id"], pool_type) in seen:
-                continue
-            result.append({
-                "tag_id": tag["id"],
-                "tag_name": tag["name"],
-                "pool_type": pool_type,
-                "pool_name": _pool_name(pool_type),
-                "total_count": 0,
-                "available_count": 0,
-                "reserved_count": 0,
-                "sent_count": 0,
-                "failed_count": 0,
-                "last_import_at": None,
-            })
-    result.sort(key=lambda x: (-(int(x.get("tag_id") or 0)), x.get("pool_type") or ""))
-    return result
+    return rows
 
 
-def get_recipient_pool_rows(tag_id, pool_type, status="", search="", page=1, page_size=50):
-    """Return a paginated, searchable recipient-pool detail view.
-
-    The dashboard only renders summary counts. This function is intentionally
-    paginated so a pool containing hundreds of thousands of recipients does
-    not freeze the browser or force SQLite to return the full table at once.
-    """
+def get_recipient_pool_rows(tag_id, pool_type=None, status="", search="", page=1, page_size=50):
+    """Return a paginated, deduplicated view of one tag's logical pool."""
     tag_id = int(tag_id)
     pool_type = _normalize_pool_type(pool_type)
     if not q_one("SELECT id FROM tags WHERE id=?", (tag_id,)):
         raise ValueError("标签不存在")
 
-    allowed_statuses = {"available", "reserved", "sent", "failed"}
+    allowed_statuses = {"available", "reserved", "sent", "failed", "unavailable"}
     status = (status or "").strip().lower()
     if status and status not in allowed_statuses:
         raise ValueError("未知收件人状态")
@@ -592,45 +767,97 @@ def get_recipient_pool_rows(tag_id, pool_type, status="", search="", page=1, pag
     except (TypeError, ValueError):
         page_size = 50
 
-    conditions = ["p.tag_id=?", "p.pool_type=?"]
-    params = [tag_id, pool_type]
+    conditions = []
+    params = []
     if status:
-        conditions.append("p.status=?")
+        conditions.append("v.logical_status=?")
         params.append(status)
     search = (search or "").strip()
     if search:
         like = "%{}%".format(search.replace("%", "\\%").replace("_", "\\_"))
-        conditions.append("(p.email LIKE ? ESCAPE '\\' OR COALESCE(p.name,'') LIKE ? ESCAPE '\\' OR COALESCE(p.source_name,'') LIKE ? ESCAPE '\\')")
+        conditions.append("""EXISTS (
+            SELECT 1 FROM recipient_pool match_row
+            WHERE match_row.tag_id=v.tag_id
+              AND lower(trim(match_row.email))=lower(trim(v.email))
+              AND (match_row.email LIKE ? ESCAPE '\\'
+                OR COALESCE(match_row.name,'') LIKE ? ESCAPE '\\'
+                OR COALESCE(match_row.source_name,'') LIKE ? ESCAPE '\\')
+        )""")
         params.extend([like, like, like])
 
-    where_sql = " AND ".join(conditions)
-    total = _count("SELECT COUNT(*) AS c FROM recipient_pool p WHERE " + where_sql, tuple(params))
+    where_sql = "WHERE " + " AND ".join(conditions) if conditions else ""
+    base_cte = """
+        WITH flags AS (
+            SELECT lower(trim(p.email)) AS email_key,
+                COUNT(*) AS physical_count,
+                MAX(p.status='reserved') AS reserved,
+                MAX(p.status='sent') AS sent,
+                MAX(p.status='failed') AS failed,
+                MAX(p.status='available' AND (p.pool_type<>'warmup_named' OR EXISTS (
+                    SELECT 1 FROM recipient_pool_list_members lm
+                    JOIN recipient_lists l ON l.id=lm.list_id
+                    WHERE lm.pool_id=p.id AND l.tag_id=p.tag_id AND l.status='active'
+                      AND l.consent_source IS NOT NULL AND l.consented_at IS NOT NULL
+                ))) AS usable
+            FROM recipient_pool p WHERE p.tag_id=? GROUP BY lower(trim(p.email))
+        ), logical AS (
+            SELECT *, CASE
+                WHEN reserved THEN 'reserved'
+                WHEN sent THEN 'sent'
+                WHEN failed THEN 'failed'
+                WHEN usable THEN 'available'
+                ELSE 'unavailable' END AS logical_status
+            FROM flags
+        ), ranked AS (
+            SELECT p.*, ROW_NUMBER() OVER (
+                PARTITION BY lower(trim(p.email))
+                ORDER BY CASE p.status
+                    WHEN 'reserved' THEN 0 WHEN 'sent' THEN 1
+                    WHEN 'failed' THEN 2 ELSE 3 END, p.id
+            ) AS row_rank
+            FROM recipient_pool p WHERE p.tag_id=?
+        ), visible AS (
+            SELECT p.*, g.logical_status, g.physical_count
+            FROM ranked p JOIN logical g ON g.email_key=lower(trim(p.email))
+            WHERE p.row_rank=1
+        )
+    """
+    query_params = (tag_id, tag_id, *params)
+    total = _count(base_cte + " SELECT COUNT(*) AS c FROM visible v " + where_sql, query_params)
     pages = max(1, (total + page_size - 1) // page_size)
     page = min(page, pages)
     offset = (page - 1) * page_size
-    rows = q_all(
-        """
-        SELECT
-            p.*,
-            t.name AS tag_name,
-            (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.recipient_pool_id=p.id) AS schedule_count,
-            (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.recipient_pool_id=p.id AND s.status IN ('pending','sending')) AS active_schedule_count
-        FROM recipient_pool p
-        JOIN tags t ON t.id=p.tag_id
-        WHERE {where_sql}
-        ORDER BY p.id DESC
-        LIMIT ? OFFSET ?
-        """.format(where_sql=where_sql),
-        tuple(params + [page_size, offset]),
-    )
+    rows = q_all(base_cte + """
+        SELECT v.*, t.name AS tag_name,
+            (SELECT COUNT(*) FROM scheduled_email_tasks s
+             JOIN recipient_pool rp ON rp.id=s.recipient_pool_id
+             WHERE rp.tag_id=v.tag_id AND lower(trim(rp.email))=lower(trim(v.email))) AS schedule_count,
+            (SELECT COUNT(*) FROM scheduled_email_tasks s
+             JOIN recipient_pool rp ON rp.id=s.recipient_pool_id
+             WHERE rp.tag_id=v.tag_id AND lower(trim(rp.email))=lower(trim(v.email))
+               AND s.status IN ('pending','sending','needs_review')) AS active_schedule_count,
+            (SELECT COUNT(*) FROM recipient_pool_list_members lm
+             JOIN recipient_pool rp ON rp.id=lm.pool_id
+             WHERE rp.tag_id=v.tag_id AND lower(trim(rp.email))=lower(trim(v.email))) AS membership_count
+        FROM visible v JOIN tags t ON t.id=v.tag_id
+        {where_sql} ORDER BY v.id DESC LIMIT ? OFFSET ?
+    """.format(where_sql=where_sql), (*query_params, page_size, offset))
     for row in rows:
         row["schedule_count"] = int(row.get("schedule_count") or 0)
         row["active_schedule_count"] = int(row.get("active_schedule_count") or 0)
-        row["pool_name"] = _pool_name(row.get("pool_type"))
+        row["membership_count"] = int(row.get("membership_count") or 0)
+        row["physical_pool_type"] = row["pool_type"]
+        row["pool_type"] = POOL_UNIFIED
+        row["status"] = row.pop("logical_status")
+        row["pool_name"] = _pool_name(POOL_UNIFIED)
         row["identity_editable"] = bool(
-            row.get("status") == "available" and row["schedule_count"] == 0
+            row["status"] == "available" and row["schedule_count"] == 0
+            and row["membership_count"] == 0 and row["physical_count"] == 1
         )
-        row["deletable"] = row["identity_editable"]
+        row["deletable"] = bool(
+            row["status"] == "available" and row["schedule_count"] == 0
+            and row["membership_count"] == 0
+        )
 
     return {
         "rows": rows,
@@ -647,53 +874,74 @@ def get_recipient_pool_rows(tag_id, pool_type, status="", search="", page=1, pag
 
 
 def update_recipient_pool_entry(recipient_id, tag_id, pool_type, email, name="", source_name=""):
-    """Edit one recipient without invalidating generated schedules.
-
-    Email/tag/pool identity can only change while the recipient is still
-    available and has never been copied into a schedule. Name and source notes
-    remain editable for audit corrections after use.
-    """
+    """Edit a logical recipient while retaining historical pool references."""
     recipient_id = int(recipient_id)
     tag_id = int(tag_id)
-    pool_type = _normalize_pool_type(pool_type)
+    _normalize_pool_type(pool_type)  # compatibility only; callers cannot move pools
     email = (email or "").strip().lower()
     name = (name or "").strip()
     source_name = (source_name or "").strip()
     if not is_valid_email(email):
         raise ValueError("邮箱格式不正确")
-    if not q_one("SELECT id FROM tags WHERE id=?", (tag_id,)):
-        raise ValueError("标签不存在")
-
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM tags WHERE id=?", (tag_id,)).fetchone():
+            raise ValueError("标签不存在")
         row = conn.execute("SELECT * FROM recipient_pool WHERE id=?", (recipient_id,)).fetchone()
         if not row:
             raise ValueError("收件人不存在")
-        if row["pool_type"] == "warmup_named":
-            raise ValueError("具名名单成员由预热系统管理，不能通过旧收件人池修改。")
+        old_tag_id = int(row["tag_id"])
+        old_email = (row["email"] or "").strip().lower()
         schedule_count = int(conn.execute(
-            "SELECT COUNT(*) FROM scheduled_email_tasks WHERE recipient_pool_id=?",
-            (recipient_id,),
+            """SELECT COUNT(*) FROM scheduled_email_tasks s
+               JOIN recipient_pool p ON p.id=s.recipient_pool_id
+               WHERE p.tag_id=? AND lower(trim(p.email))=?""",
+            (old_tag_id, old_email),
+        ).fetchone()[0])
+        membership_count = int(conn.execute(
+            """SELECT COUNT(*) FROM recipient_pool_list_members lm
+               JOIN recipient_pool p ON p.id=lm.pool_id
+               WHERE p.tag_id=? AND lower(trim(p.email))=?""",
+            (old_tag_id, old_email),
+        ).fetchone()[0])
+        duplicate_count = int(conn.execute(
+            "SELECT COUNT(*) FROM recipient_pool WHERE tag_id=? AND lower(trim(email))=?",
+            (old_tag_id, old_email),
         ).fetchone()[0])
         identity_changed = (
-            int(row["tag_id"]) != tag_id
-            or row["pool_type"] != pool_type
-            or (row["email"] or "").lower() != email
+            old_tag_id != tag_id or old_email != email
         )
-        if identity_changed and (row["status"] != "available" or schedule_count > 0):
-            raise ValueError("该收件人已进入发送流程，只能修改姓名和来源备注")
+        if identity_changed:
+            if (row["status"] != "available" or schedule_count or membership_count
+                    or duplicate_count != 1):
+                raise ValueError("该邮箱有发送记录、名单关联或历史重复行，只能修改姓名和来源备注。")
+            if conn.execute("""
+                SELECT 1 FROM send_log l
+                LEFT JOIN mail_tasks m ON m.id=l.task_id
+                LEFT JOIN send_channels c ON c.id=l.channel_id
+                WHERE lower(trim(l.recipient_email))=? AND l.status='sent'
+                  AND (COALESCE(m.tag_id,c.tag_id)=? OR (m.tag_id IS NULL AND c.tag_id IS NULL))
+                LIMIT 1
+            """, (old_email, old_tag_id)).fetchone():
+                raise ValueError("该邮箱已有发送审计记录，不能修改地址或标签。")
+            if conn.execute("""
+                SELECT 1 FROM recipient_pool WHERE tag_id=? AND lower(trim(email))=? LIMIT 1
+            """, (tag_id, email)).fetchone():
+                raise ValueError("目标标签的统一池中已存在该邮箱。")
         try:
-            conn.execute(
-                """
-                UPDATE recipient_pool
-                SET tag_id=?, pool_type=?, email=?, name=?, source_name=?, updated_at=?
-                WHERE id=?
-                """,
-                (tag_id, pool_type, email, name, source_name, now_iso(), recipient_id),
-            )
+            if identity_changed:
+                conn.execute("""
+                    UPDATE recipient_pool
+                    SET tag_id=?, pool_type=?, email=?, name=?, source_name=?, updated_at=?
+                    WHERE id=?
+                """, (tag_id, POOL_UNIFIED, email, name, source_name, now_iso(), recipient_id))
+            else:
+                conn.execute("""
+                    UPDATE recipient_pool SET name=?, source_name=?, updated_at=? WHERE id=?
+                """, (name, source_name, now_iso(), recipient_id))
         except sqlite3.IntegrityError as exc:
-            raise ValueError("目标标签和库中已存在该邮箱") from exc
+            raise ValueError("目标标签的统一池中已存在该邮箱。") from exc
         conn.commit()
     except Exception:
         conn.rollback()
@@ -704,31 +952,40 @@ def update_recipient_pool_entry(recipient_id, tag_id, pool_type, email, name="",
 
 
 def delete_recipient_pool_entry(recipient_id):
-    """Physically delete one unused recipient.
-
-    Used recipients are retained so schedules, send logs, and audit history do
-    not point at a removed pool record.
-    """
+    """Delete all unused physical copies of one logical address atomically."""
     recipient_id = int(recipient_id)
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT id, email, status, pool_type FROM recipient_pool WHERE id=?", (recipient_id,)).fetchone()
+        row = conn.execute("SELECT id, tag_id, email FROM recipient_pool WHERE id=?", (recipient_id,)).fetchone()
         if not row:
             raise ValueError("收件人不存在")
-        if row["pool_type"] == "warmup_named":
-            raise ValueError("具名名单成员由预热系统管理，不能通过旧收件人池删除。")
-        schedule_count = int(conn.execute(
-            "SELECT COUNT(*) FROM scheduled_email_tasks WHERE recipient_pool_id=?",
-            (recipient_id,),
-        ).fetchone()[0])
-        if row["status"] != "available" or schedule_count > 0:
-            raise ValueError("该收件人已被任务使用，不能删除；可保留用于发送记录审计")
+        tag_id = int(row["tag_id"])
+        email_key = row["email"].strip().lower()
+        blocked = conn.execute("""
+            SELECT 1 FROM recipient_pool p
+            WHERE p.tag_id=? AND lower(trim(p.email))=?
+              AND (p.status!='available'
+                   OR EXISTS (SELECT 1 FROM scheduled_email_tasks s WHERE s.recipient_pool_id=p.id)
+                   OR EXISTS (SELECT 1 FROM recipient_pool_list_members lm WHERE lm.pool_id=p.id))
+            LIMIT 1
+        """, (tag_id, email_key)).fetchone()
+        if blocked:
+            raise ValueError("该邮箱有计划、发送状态或名单关联，不能删除。")
+        if conn.execute("""
+            SELECT 1 FROM send_log l
+            LEFT JOIN mail_tasks m ON m.id=l.task_id
+            LEFT JOIN send_channels c ON c.id=l.channel_id
+            WHERE lower(trim(l.recipient_email))=? AND l.status='sent'
+              AND (COALESCE(m.tag_id,c.tag_id)=? OR (m.tag_id IS NULL AND c.tag_id IS NULL))
+            LIMIT 1
+        """, (email_key, tag_id)).fetchone():
+            raise ValueError("该邮箱已有发送审计记录，不能删除。")
         deleted = conn.execute(
-            "DELETE FROM recipient_pool WHERE id=? AND status='available'",
-            (recipient_id,),
+            "DELETE FROM recipient_pool WHERE tag_id=? AND lower(trim(email))=? AND status='available'",
+            (tag_id, email_key),
         ).rowcount
-        if deleted != 1:
+        if not deleted:
             raise ValueError("收件人状态已变化，请刷新后重试")
         conn.commit()
     except Exception:
@@ -736,13 +993,13 @@ def delete_recipient_pool_entry(recipient_id):
         raise
     finally:
         conn.close()
-    return {"ok": True, "id": recipient_id, "email": row["email"]}
+    return {"ok": True, "id": recipient_id, "email": row["email"], "deleted": deleted}
 
 
-def delete_available_recipient_pool(tag_id, pool_type):
-    """Delete all currently unused recipients in one tag/pool group."""
+def delete_available_recipient_pool(tag_id, pool_type=None):
+    """Clear unused logical recipients without deleting task or list history."""
     tag_id = int(tag_id)
-    pool_type = _normalize_pool_type(pool_type)
+    _normalize_pool_type(pool_type)
     if not q_one("SELECT id FROM tags WHERE id=?", (tag_id,)):
         raise ValueError("标签不存在")
     conn = get_conn()
@@ -751,13 +1008,32 @@ def delete_available_recipient_pool(tag_id, pool_type):
         deleted = conn.execute(
             """
             DELETE FROM recipient_pool
-            WHERE tag_id=? AND pool_type=? AND status='available'
+            WHERE tag_id=? AND status='available'
               AND NOT EXISTS (
                 SELECT 1 FROM scheduled_email_tasks s
                 WHERE s.recipient_pool_id=recipient_pool.id
               )
+              AND NOT EXISTS (
+                SELECT 1 FROM recipient_pool_list_members lm
+                WHERE lm.pool_id=recipient_pool.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM recipient_pool other
+                WHERE other.tag_id=recipient_pool.tag_id
+                  AND lower(trim(other.email))=lower(trim(recipient_pool.email))
+                  AND other.status!='available'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM send_log l
+                LEFT JOIN mail_tasks m ON m.id=l.task_id
+                LEFT JOIN send_channels c ON c.id=l.channel_id
+                WHERE lower(trim(l.recipient_email))=lower(trim(recipient_pool.email))
+                  AND l.status='sent'
+                  AND (COALESCE(m.tag_id,c.tag_id)=recipient_pool.tag_id
+                       OR (m.tag_id IS NULL AND c.tag_id IS NULL))
+              )
             """,
-            (tag_id, pool_type),
+            (tag_id,),
         ).rowcount
         conn.commit()
     except Exception:
@@ -895,11 +1171,11 @@ def _release_pool_reservations_for_task(task_id):
     try:
         conn.execute("BEGIN IMMEDIATE")
         sending = conn.execute(
-            "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status='sending'",
+            "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status IN ('sending','needs_review')",
             (task_id,),
         ).fetchone()["c"]
         if sending:
-            raise ValueError("任务仍有邮件正在发送，请稍后再重试。")
+            raise ValueError("任务有发送中或待核销邮件，请先处理。")
         stamp = now_iso()
         conn.execute("""
             UPDATE recipient_pool
@@ -961,15 +1237,21 @@ def generate_plan(task_id, force=False):
             return {"ok": False, "message": "Plan already exists. Use force to recreate.", "existing": existing}
         if force and status_counts.get("sent", 0) > 0:
             raise ValueError("该任务已经有已发送记录，不能直接重生成。请新建任务，避免重复发送。")
-        if force and status_counts.get("sending", 0) > 0:
-            raise ValueError("该任务仍有邮件正在发送，不能重生成。请稍后再试。")
+        if force and (status_counts.get("sending", 0) > 0 or status_counts.get("needs_review", 0) > 0):
+            raise ValueError("任务有发送中或待核销邮件，不能重生成。")
+        if force and cur.execute("SELECT 1 FROM send_log WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+            raise ValueError("任务已有发送尝试记录，请保留审计并新建任务。")
 
         channel_row = cur.execute("SELECT * FROM send_channels WHERE id=?", (task["channel_id"],)).fetchone()
         if not channel_row:
             raise ValueError("Channel not found")
         channel = dict(channel_row)
-        if channel.get("status") != "active":
-            raise ValueError("Channel is not active")
+        group = cur.execute("SELECT tag_id,status FROM template_groups WHERE id=?", (task["template_group_id"],)).fetchone()
+        tag = cur.execute("SELECT status FROM tags WHERE id=?", (task["tag_id"],)).fetchone()
+        if (channel.get("status") != "active" or channel["tag_id"] != task["tag_id"]
+                or not group or group["tag_id"] != task["tag_id"] or group["status"] != "active"
+                or not tag or tag["status"] != "active"):
+            raise ValueError("标签、通道或模板组不一致或已停用。")
 
         templates = [dict(row) for row in cur.execute(
             "SELECT * FROM template_files WHERE group_id=? ORDER BY id",
@@ -1018,91 +1300,72 @@ def generate_plan(task_id, force=False):
         if sum(limit_by_day.values()) <= 0:
             raise ValueError("未来 30 天该通道没有可用发送容量，请提高日限额或选择其他通道。")
 
-        need_by_type = _pool_need_by_type(limit_by_day)
+        # Historical pool_type values remain in the database for existing plans;
+        # new plans see one logical, tag-scoped pool keyed by normalized email.
+        need_total = sum(limit_by_day.values())
+        candidates = cur.execute("""
+            SELECT id, email, name, pool_type FROM (
+                SELECT p.id,p.email,p.name,p.pool_type,
+                    CASE WHEN p.reserved_task_id=? THEN 0 ELSE 1 END AS own_priority,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY lower(trim(p.email))
+                        ORDER BY CASE WHEN p.reserved_task_id=? THEN 0 ELSE 1 END,p.id
+                    ) AS email_rank
+                FROM recipient_pool p
+                WHERE p.tag_id=?
+                  AND (p.status='available' OR (p.reserved_task_id=? AND p.status='reserved'))
+                  AND (p.pool_type<>'warmup_named' OR EXISTS (
+                      SELECT 1 FROM recipient_pool_list_members lm
+                      JOIN recipient_lists l ON l.id=lm.list_id
+                      WHERE lm.pool_id=p.id AND l.tag_id=p.tag_id AND l.status='active'
+                        AND l.consent_source IS NOT NULL AND l.consented_at IS NOT NULL
+                  ))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scheduled_email_tasks s
+                      WHERE s.tag_id=p.tag_id AND lower(trim(s.recipient_email))=lower(trim(p.email))
+                        AND s.task_id<>? AND s.status IN ('pending','sending','sent','needs_review')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM recipient_pool other_pool
+                      WHERE other_pool.tag_id=p.tag_id AND other_pool.id<>p.id
+                        AND lower(trim(other_pool.email))=lower(trim(p.email))
+                        AND (other_pool.status IN ('sent','failed') OR
+                             (other_pool.status='reserved' AND COALESCE(other_pool.reserved_task_id,-1)<>?))
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM send_log l
+                      LEFT JOIN mail_tasks other ON other.id=l.task_id
+                      LEFT JOIN send_channels sent_channel ON sent_channel.id=l.channel_id
+                      WHERE (COALESCE(other.tag_id,sent_channel.tag_id)=p.tag_id
+                             OR (other.tag_id IS NULL AND sent_channel.tag_id IS NULL))
+                        AND lower(trim(l.recipient_email))=lower(trim(p.email))
+                        AND l.status='sent'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sendgrid_events e
+                      WHERE lower(trim(e.email))=lower(trim(p.email))
+                        AND lower(e.event_type) IN ('unsubscribe','group_unsubscribe','spamreport','spam report','bounce')
+                  )
+            ) WHERE email_rank=1 ORDER BY own_priority,id LIMIT ?
+        """, (task_id, task_id, task["tag_id"], task_id, task_id, task_id, need_total)).fetchall()
+        if len(candidates) < need_total:
+            raise ValueError("统一收件人池可用且去重后的邮箱不足：需要 {}，实际 {}。".format(
+                need_total, len(candidates)
+            ))
         selected = []
-        selected_emails = set()
-        selected_by_pool = {}
-        for pool_type in (POOL_0_3, POOL_4_30):
-            need = int(need_by_type[pool_type])
-            if need <= 0:
-                selected_by_pool[pool_type] = []
-                continue
-            # Cross-pool duplicates can consume at most one extra row per email
-            # already selected, so this bounded over-fetch is sufficient.
-            fetch_limit = need + len(selected_emails)
-            candidates = cur.execute("""
-                SELECT id, email, name, pool_type
-                FROM (
-                    SELECT id, email, name, pool_type,
-                           CASE WHEN reserved_task_id=? THEN 0 ELSE 1 END AS own_priority,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY lower(trim(email))
-                               ORDER BY CASE WHEN reserved_task_id=? THEN 0 ELSE 1 END, id ASC
-                           ) AS email_rank
-                    FROM recipient_pool
-                    WHERE tag_id=? AND pool_type=?
-                      AND (status='available' OR (reserved_task_id=? AND status IN ('reserved', 'failed')))
-                      AND NOT EXISTS (
-                          SELECT 1 FROM scheduled_email_tasks s
-                          WHERE s.tag_id=recipient_pool.tag_id
-                            AND lower(trim(s.recipient_email))=lower(trim(recipient_pool.email))
-                            AND s.task_id<>?
-                            AND s.status IN ('pending','sending','sent','needs_review')
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM recipient_pool other_pool
-                          WHERE other_pool.tag_id=recipient_pool.tag_id
-                            AND other_pool.id<>recipient_pool.id
-                            AND lower(trim(other_pool.email))=lower(trim(recipient_pool.email))
-                            AND other_pool.status IN ('reserved','sent')
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM send_log l
-                          LEFT JOIN mail_tasks other ON other.id=l.task_id
-                          LEFT JOIN send_channels sent_channel ON sent_channel.id=l.channel_id
-                          WHERE (COALESCE(other.tag_id,sent_channel.tag_id)=recipient_pool.tag_id
-                                 OR (other.tag_id IS NULL AND sent_channel.tag_id IS NULL))
-                            AND lower(trim(l.recipient_email))=lower(trim(recipient_pool.email))
-                            AND l.status='sent'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM sendgrid_events e
-                          WHERE lower(trim(e.email))=lower(trim(recipient_pool.email))
-                            AND lower(e.event_type) IN ('unsubscribe','group_unsubscribe','spamreport','spam report','bounce')
-                      )
-                )
-                WHERE email_rank=1
-                ORDER BY own_priority, id ASC
-                LIMIT ?
-            """, (task_id, task_id, task["tag_id"], pool_type, task_id, task_id, fetch_limit)).fetchall()
-            chosen = []
-            for row in candidates:
-                item = dict(row)
-                normalized = (item.get("email") or "").strip().lower()
-                if not normalized or normalized in selected_emails:
-                    continue
-                selected_emails.add(normalized)
-                chosen.append(item)
-                if len(chosen) >= need:
-                    break
-            if len(chosen) < need:
-                raise ValueError("{} 可用且去重后的邮箱不足：需要 {}，实际 {}。".format(
-                    _pool_name(pool_type), need, len(chosen)
-                ))
-            selected_by_pool[pool_type] = chosen
-
+        index = 0
         for day_offset in range(30):
-            pool_type = POOL_0_3 if day_offset <= 2 else POOL_4_30
-            count = int(limit_by_day[day_offset])
-            day_recipients = selected_by_pool[pool_type][:count]
-            selected_by_pool[pool_type] = selected_by_pool[pool_type][count:]
-            selected.extend((day_offset, rec) for rec in day_recipients)
+            for _ in range(int(limit_by_day[day_offset])):
+                selected.append((day_offset, dict(candidates[index])))
+                index += 1
 
         rows = []
         stamp = now_iso()
         for day_offset, rec in selected:
             day_start, day_end = _day_window(plan_start, day_offset)
             tfile = random.choice(templates)
+            subject_template = tfile.get("subject_template") or task["subject_template"]
+            from_name = tfile.get("from_name") or channel.get("from_name") or ""
             c8 = code8()
             variables = {
                 "from_mail": channel["from_email"],
@@ -1112,8 +1375,8 @@ def generate_plan(task_id, force=False):
             rows.append((
                 task["id"], task["tag_id"], task["channel_id"],
                 rec["email"], rec.get("name") or "",
-                channel["from_email"], channel.get("from_name") or "",
-                task["subject_template"], render_vars(task["subject_template"], variables),
+                channel["from_email"], from_name,
+                subject_template, render_vars(subject_template, variables),
                 tfile["file_path"], c8,
                 _random_time(day_start, day_end).isoformat(timespec="seconds"),
                 "pending", 0, stamp, rec["id"], rec["pool_type"], None, None,
@@ -1164,8 +1427,7 @@ def generate_plan(task_id, force=False):
         return {
             "ok": True,
             "created": len(rows),
-            "need_0_3": need_by_type[POOL_0_3],
-            "need_4_30": need_by_type[POOL_4_30],
+            "need_total": need_total,
             "daily_limits": limit_by_day,
             "requested_daily_limits": requested_limits,
             "channel_daily_limit": daily_limit,
@@ -1179,18 +1441,30 @@ def generate_plan(task_id, force=False):
 
 
 def start_task(task_id):
-    execute("UPDATE mail_tasks SET status='running', updated_at=? WHERE id=? AND task_kind='legacy'",
-            (now_iso(), task_id))
+    changed = execute_rowcount("""
+        UPDATE mail_tasks SET status='running', updated_at=?
+        WHERE id=? AND task_kind='legacy' AND status IN ('planned','paused')
+    """, (now_iso(), task_id))
+    if changed != 1:
+        raise ValueError("历史任务尚未生成计划或状态不允许启动。")
 
 
 def pause_task(task_id):
-    execute("UPDATE mail_tasks SET status='paused', updated_at=? WHERE id=? AND task_kind='legacy'",
-            (now_iso(), task_id))
+    changed = execute_rowcount("""
+        UPDATE mail_tasks SET status='paused', updated_at=?
+        WHERE id=? AND task_kind='legacy' AND status='running'
+    """, (now_iso(), task_id))
+    if changed != 1:
+        raise ValueError("该历史任务当前不能暂停。")
 
 
 def resume_task(task_id):
-    execute("UPDATE mail_tasks SET status='running', updated_at=? WHERE id=? AND task_kind='legacy'",
-            (now_iso(), task_id))
+    changed = execute_rowcount("""
+        UPDATE mail_tasks SET status='running', updated_at=?
+        WHERE id=? AND task_kind='legacy' AND status='paused'
+    """, (now_iso(), task_id))
+    if changed != 1:
+        raise ValueError("该历史任务当前不能继续。")
 
 
 def delete_mail_task(task_id):
@@ -1202,11 +1476,12 @@ def delete_mail_task(task_id):
         if not kind or kind["task_kind"] != "legacy":
             raise ValueError("预热任务请从预热系统管理。")
         sending = cur.execute(
-            "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status='sending'",
+            "SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE task_id=? AND status IN ('sending','needs_review','sent')",
             (task_id,),
         ).fetchone()["c"]
-        if sending:
-            raise ValueError("任务仍有邮件正在发送，请稍后再删除。")
+        logged = cur.execute("SELECT 1 FROM send_log WHERE task_id=? LIMIT 1", (task_id,)).fetchone()
+        if sending or logged:
+            raise ValueError("任务有发送或核销记录，不能删除历史。")
         stamp = now_iso()
         cur.execute("""
             UPDATE recipient_pool
@@ -1309,6 +1584,9 @@ def get_schedule_tag_groups():
             SUM(CASE WHEN s.status='pending' THEN 1 ELSE 0 END) AS pending_count,
             SUM(CASE WHEN s.status='sent' THEN 1 ELSE 0 END) AS sent_count,
             SUM(CASE WHEN s.status='failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN s.status='needs_review' THEN 1 ELSE 0 END) AS review_count,
+            SUM(CASE WHEN s.status='sending' THEN 1 ELSE 0 END) AS sending_count,
+            SUM(CASE WHEN s.status='missed' THEN 1 ELSE 0 END) AS missed_count,
             MIN(s.scheduled_at) AS first_scheduled_at,
             MAX(s.scheduled_at) AS last_scheduled_at
         FROM scheduled_email_tasks s
@@ -1324,6 +1602,9 @@ def get_schedule_tag_groups():
         row["pending_count"] = int(row.get("pending_count") or 0)
         row["sent_count"] = int(row.get("sent_count") or 0)
         row["failed_count"] = int(row.get("failed_count") or 0)
+        row["review_count"] = int(row.get("review_count") or 0)
+        row["sending_count"] = int(row.get("sending_count") or 0)
+        row["missed_count"] = int(row.get("missed_count") or 0)
         row["total_count"] = int(row.get("total_count") or 0)
         row["detail_key"] = "schedule-{}-{}-{}".format(row["tag_id"], row["task_id"], row["channel_id"])
 
@@ -1337,6 +1618,9 @@ def get_schedule_tag_groups():
                 "pending_count": 0,
                 "sent_count": 0,
                 "failed_count": 0,
+                "review_count": 0,
+                "sending_count": 0,
+                "missed_count": 0,
                 "plans": [],
             }
         tag_group = tag_map[tag_id]
@@ -1344,6 +1628,9 @@ def get_schedule_tag_groups():
         tag_group["pending_count"] += row["pending_count"]
         tag_group["sent_count"] += row["sent_count"]
         tag_group["failed_count"] += row["failed_count"]
+        tag_group["review_count"] += row["review_count"]
+        tag_group["sending_count"] += row["sending_count"]
+        tag_group["missed_count"] += row["missed_count"]
         tag_group["plans"].append(row)
 
     return list(tag_map.values())
@@ -1357,6 +1644,9 @@ def get_schedule_detail_dates(tag_id, task_id, channel_id, from_email):
             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
             SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent_count,
             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN status='needs_review' THEN 1 ELSE 0 END) AS review_count,
+            SUM(CASE WHEN status='sending' THEN 1 ELSE 0 END) AS sending_count,
+            SUM(CASE WHEN status='missed' THEN 1 ELSE 0 END) AS missed_count,
             MIN(scheduled_at) AS first_time,
             MAX(scheduled_at) AS last_time
         FROM scheduled_email_tasks
@@ -1369,6 +1659,9 @@ def get_schedule_detail_dates(tag_id, task_id, channel_id, from_email):
         row["pending_count"] = int(row.get("pending_count") or 0)
         row["sent_count"] = int(row.get("sent_count") or 0)
         row["failed_count"] = int(row.get("failed_count") or 0)
+        row["review_count"] = int(row.get("review_count") or 0)
+        row["sending_count"] = int(row.get("sending_count") or 0)
+        row["missed_count"] = int(row.get("missed_count") or 0)
     return rows
 
 
@@ -1496,55 +1789,33 @@ def get_tag_detail(tag_id):
             (SELECT COUNT(*) FROM scheduled_email_tasks WHERE tag_id=? AND status='pending') AS scheduled_pending,
             (SELECT COUNT(*) FROM scheduled_email_tasks WHERE tag_id=? AND status='sent') AS scheduled_sent,
             (SELECT COUNT(*) FROM scheduled_email_tasks WHERE tag_id=? AND status='failed') AS scheduled_failed,
-            (SELECT COUNT(*) FROM recipient_pool WHERE tag_id=?) AS pool_total,
-            (SELECT COUNT(*) FROM recipient_pool WHERE tag_id=? AND status='available') AS pool_available,
-            (SELECT COUNT(*) FROM recipient_pool WHERE tag_id=? AND status='reserved') AS pool_reserved,
-            (SELECT COUNT(*) FROM recipient_pool WHERE tag_id=? AND status='sent') AS pool_sent,
-            (SELECT COUNT(*) FROM recipient_pool WHERE tag_id=? AND status='failed') AS pool_failed,
             (SELECT COUNT(*) FROM send_log l LEFT JOIN mail_tasks m ON m.id=l.task_id LEFT JOIN send_channels c ON c.id=l.channel_id WHERE COALESCE(m.tag_id, c.tag_id)=?) AS logs_total,
             (SELECT COUNT(*) FROM send_log l LEFT JOIN mail_tasks m ON m.id=l.task_id LEFT JOIN send_channels c ON c.id=l.channel_id WHERE COALESCE(m.tag_id, c.tag_id)=? AND l.status='sent') AS logs_sent,
             (SELECT COUNT(*) FROM send_log l LEFT JOIN mail_tasks m ON m.id=l.task_id LEFT JOIN send_channels c ON c.id=l.channel_id WHERE COALESCE(m.tag_id, c.tag_id)=? AND l.status='failed') AS logs_failed
-    """, (tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id, tag_id)) or {}
+    """, (tag_id,) * 13) or {}
     _to_int_fields(counters, [
         "channels_total", "channels_active", "template_groups_total", "template_files_total",
         "tasks_total", "tasks_running", "scheduled_total", "scheduled_pending",
-        "scheduled_sent", "scheduled_failed", "pool_total", "pool_available", "pool_reserved",
-        "pool_sent", "pool_failed", "logs_total", "logs_sent", "logs_failed"
+        "scheduled_sent", "scheduled_failed", "logs_total", "logs_sent", "logs_failed"
     ])
 
-    pool_rows = q_all("""
-        SELECT
-            pool_type,
-            CASE pool_type WHEN 'warmup_0_3' THEN '0-3天库' WHEN 'warmup_4_30' THEN '4-30天库' ELSE pool_type END AS pool_name,
-            COUNT(*) AS total_count,
-            SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) AS available_count,
-            SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END) AS reserved_count,
-            SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent_count,
-            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
-            MAX(created_at) AS last_import_at,
-            MAX(updated_at) AS last_updated_at
-        FROM recipient_pool
-        WHERE tag_id=?
-        GROUP BY pool_type
-        ORDER BY pool_type
-    """, (tag_id,))
-    pool_by_type = {r.get("pool_type"): r for r in pool_rows}
-    pools = []
-    for pool_type, pool_name in [("warmup_0_3", "0-3天库"), ("warmup_4_30", "4-30天库")]:
-        row = pool_by_type.get(pool_type) or {
-            "pool_type": pool_type,
-            "pool_name": pool_name,
-            "total_count": 0,
-            "available_count": 0,
-            "reserved_count": 0,
-            "sent_count": 0,
-            "failed_count": 0,
-            "last_import_at": None,
-            "last_updated_at": None,
-        }
-        row["pool_name"] = pool_name
-        _to_int_fields(row, ["total_count", "available_count", "reserved_count", "sent_count", "failed_count"])
-        pools.append(row)
+    pool_summary = next(
+        (row for row in get_recipient_pool_stats() if int(row["tag_id"]) == tag_id),
+        {"pool_type": POOL_UNIFIED, "pool_name": _pool_name(POOL_UNIFIED),
+         "total_count": 0, "available_count": 0, "reserved_count": 0,
+         "sent_count": 0, "failed_count": 0, "last_import_at": None},
+    )
+    pool_summary["last_updated_at"] = q_one(
+        "SELECT MAX(updated_at) AS value FROM recipient_pool WHERE tag_id=?", (tag_id,)
+    )["value"]
+    counters.update({
+        "pool_total": pool_summary["total_count"],
+        "pool_available": pool_summary["available_count"],
+        "pool_reserved": pool_summary["reserved_count"],
+        "pool_sent": pool_summary["sent_count"],
+        "pool_failed": pool_summary["failed_count"],
+    })
+    pools = [pool_summary]
 
     channels = q_all("""
         SELECT
@@ -1582,7 +1853,7 @@ def get_tag_detail(tag_id):
 
     tasks = q_all("""
         SELECT
-            m.id, m.name, m.subject_template, m.status, m.created_at, m.updated_at,
+            m.id, m.name, m.task_kind, m.subject_template, m.status, m.created_at, m.updated_at,
             COALESCE(c.name, '未命名通道') AS channel_name,
             COALESCE(c.from_email, '') AS from_email,
             COALESCE(g.name, '未命名模板组') AS template_group_name,
@@ -1609,7 +1880,10 @@ def get_tag_detail(tag_id):
             COUNT(*) AS total_count,
             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
             SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent_count,
-            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN status='needs_review' THEN 1 ELSE 0 END) AS review_count,
+            SUM(CASE WHEN status='sending' THEN 1 ELSE 0 END) AS sending_count,
+            SUM(CASE WHEN status='missed' THEN 1 ELSE 0 END) AS missed_count
         FROM scheduled_email_tasks
         WHERE tag_id=?
         GROUP BY substr(scheduled_at, 1, 10)
@@ -1617,7 +1891,8 @@ def get_tag_detail(tag_id):
         LIMIT 60
     """, (tag_id,))
     for row in schedule_by_date:
-        _to_int_fields(row, ["total_count", "pending_count", "sent_count", "failed_count"])
+        _to_int_fields(row, ["total_count", "pending_count", "sent_count", "failed_count",
+                             "review_count", "sending_count", "missed_count"])
 
     logs_by_date = q_all("""
         SELECT
@@ -1676,11 +1951,16 @@ def get_dashboard_data():
         "template_groups": get_template_groups_with_files(),
         "tasks": q_all("""
             SELECT m.*, t.name AS tag_name, c.name AS channel_name,
-                   '自动收件人池' AS recipient_list_name,
-                   2 AS recipient_list_count,
-                   (SELECT COUNT(*) FROM recipient_pool p WHERE p.tag_id=m.tag_id AND p.status='available') AS recipient_count,
-                   (SELECT COUNT(*) FROM recipient_pool p WHERE p.tag_id=m.tag_id AND p.pool_type='warmup_0_3' AND p.status='available') AS pool_0_3_available,
-                   (SELECT COUNT(*) FROM recipient_pool p WHERE p.tag_id=m.tag_id AND p.pool_type='warmup_4_30' AND p.status='available') AS pool_4_30_available,
+                   '统一收件人池' AS recipient_list_name,
+                   1 AS recipient_list_count,
+                   (SELECT COUNT(*) FROM (
+                       SELECT lower(trim(p.email)) AS email_key
+                       FROM recipient_pool p WHERE p.tag_id=m.tag_id
+                       GROUP BY lower(trim(p.email))
+                       HAVING MAX(p.status='reserved')=0
+                          AND MAX(p.status='sent')=0
+                          AND MAX(p.status='failed')=0
+                   )) AS recipient_count,
                    (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.task_id=m.id) AS scheduled_count,
                    (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.task_id=m.id AND s.status='sent') AS sent_count,
                    (SELECT COUNT(*) FROM scheduled_email_tasks s WHERE s.task_id=m.id AND s.status='failed') AS failed_count
@@ -1699,6 +1979,14 @@ def get_dashboard_data():
             LIMIT 200
         """),
         "schedule_tag_groups": get_schedule_tag_groups(),
+        "legacy_reviews": q_all("""
+            SELECT s.id AS schedule_id,s.task_id,s.recipient_email,s.claimed_at,
+                   m.name AS task_name
+            FROM scheduled_email_tasks s JOIN mail_tasks m ON m.id=s.task_id
+            WHERE m.task_kind='legacy' AND s.status='needs_review'
+            ORDER BY s.claimed_at ASC,s.id ASC
+            LIMIT 200
+        """),
         "logs": q_all("""
             SELECT l.*, c.name AS channel_name, p.name AS proxy_name
             FROM send_log l
@@ -1713,6 +2001,7 @@ def get_dashboard_data():
             "total_sent": _count("SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE status='sent'"),
             "total_pending": _count("SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE status='pending'"),
             "total_failed": _count("SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE status='failed'"),
+            "total_review": _count("SELECT COUNT(*) AS c FROM scheduled_email_tasks WHERE status='needs_review'"),
             "active_channels": _count("SELECT COUNT(*) AS c FROM send_channels WHERE status='active'"),
             "active_users": _count("SELECT COUNT(*) AS c FROM users WHERE status='active'"),
         },
@@ -1827,10 +2116,10 @@ def _build_proxies(channel):
         return None
     proxy = q_one("SELECT * FROM proxies WHERE id=? AND status='active'", (channel["proxy_id"],))
     if not proxy:
-        return None
+        raise ValueError("Configured proxy is missing or inactive")
     proxy_url = normalize_proxy_url(unprotect(proxy["proxy_url_protected"]))
     if not proxy_url:
-        return None
+        raise ValueError("Configured proxy URL is invalid")
     return {"http": proxy_url, "https": proxy_url}
 
 
@@ -1853,11 +2142,21 @@ def _send_via_sendgrid(scheduled):
     settings = get_settings()
     channel = q_one("SELECT * FROM send_channels WHERE id=?", (scheduled["channel_id"],))
     if not channel:
-        return False, None, "Channel not found", None
+        return False, None, "Channel not found", "NOT_SENT"
 
+    request_started = False
     try:
-        if channel["status"] != "active":
-            return False, None, "Channel is not active", None
+        task_group = q_one("""
+            SELECT m.tag_id AS task_tag,g.tag_id AS group_tag,g.status AS group_status,
+                   t.status AS tag_status
+            FROM mail_tasks m JOIN template_groups g ON g.id=m.template_group_id
+            JOIN tags t ON t.id=m.tag_id WHERE m.id=?
+        """, (scheduled["task_id"],))
+        if (channel["status"] != "active" or channel["tag_id"] != scheduled["tag_id"]
+                or not task_group or task_group["task_tag"] != scheduled["tag_id"]
+                or task_group["group_tag"] != scheduled["tag_id"]
+                or task_group["group_status"] != "active" or task_group["tag_status"] != "active"):
+            return False, None, "Tag, channel or template is inactive or mismatched", "NOT_SENT"
 
         html = Path(scheduled["html_file"]).read_text(encoding="utf-8", errors="ignore")
         variables = {
@@ -1872,7 +2171,7 @@ def _send_via_sendgrid(scheduled):
         if settings.require_unsubscribe_for_marketing and tag and tag["service_type"] == "marketing":
             low = html_rendered.lower()
             if "unsubscribe" not in low and "退订" not in low:
-                return False, None, "Marketing HTML does not contain unsubscribe keyword/link", None
+                return False, None, "Marketing HTML does not contain unsubscribe keyword/link", "NOT_SENT"
 
         payload = {
             "personalizations": [{
@@ -1896,11 +2195,13 @@ def _send_via_sendgrid(scheduled):
             "Authorization": "Bearer {}".format(unprotect(channel["api_key_protected"])),
             "Content-Type": "application/json",
         }
+        proxies = _build_proxies(channel)
+        request_started = True
         resp = requests.post(
             SENDGRID_URL,
             headers=headers,
             json=payload,
-            proxies=_build_proxies(channel),
+            proxies=proxies,
             timeout=settings.request_timeout_seconds,
         )
         msg_id = resp.headers.get("X-Message-Id") or resp.headers.get("x-message-id")
@@ -1918,7 +2219,9 @@ def _send_via_sendgrid(scheduled):
             scheduled, channel, scheduled.get("subject_rendered") or "", None, None,
             "failed", error, None, None,
         )
-        return False, None, error, None
+        # Preflight errors are definitely unsent. A transport/logging exception
+        # after starting HTTP might have been accepted, so it needs review.
+        return False, None, error, None if request_started else "NOT_SENT"
 
 
 def _next_day_retry_at():
@@ -1930,7 +2233,7 @@ def _next_day_retry_at():
 def _recover_stale_sending_claims():
     settings = get_settings()
     timeout_seconds = max(settings.worker_claim_timeout_seconds, settings.request_timeout_seconds * 2)
-    cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
+    cutoff_epoch = int(time.time()) - timeout_seconds
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1943,25 +2246,25 @@ def _recover_stale_sending_claims():
                  WHERE l.scheduled_task_id=s.id AND l.status='sent') AS accepted_at
             FROM scheduled_email_tasks s JOIN mail_tasks m ON m.id=s.task_id
             WHERE m.task_kind='legacy' AND s.status='sending'
-              AND (s.claimed_at IS NULL OR s.claimed_at<=?)
+              AND (s.claimed_epoch IS NULL OR s.claimed_epoch<=?)
               AND EXISTS (
                   SELECT 1 FROM send_log l
                   WHERE l.scheduled_task_id=s.id AND l.status='sent'
               )
-        """, (cutoff,)).fetchall()
+        """, (cutoff_epoch,)).fetchall()
         for row in logged_successes:
             accepted_at = row["accepted_at"] or now_iso()
             cur.execute("""
                 UPDATE scheduled_email_tasks
-                SET status='sent',sent_at=?,worker_id=NULL,claimed_at=NULL,
+                SET status='sent',sent_at=?,worker_id=NULL,claimed_at=NULL,claimed_epoch=NULL,
                     channel_slot_date=NULL,last_error=NULL
                 WHERE id=? AND status='sending'
             """, (accepted_at, row["id"]))
             if row["channel_slot_date"]:
                 cur.execute("""
                     UPDATE channel_daily_stats
-                    SET reserved_count=MAX(0,reserved_count-1),sent_count=sent_count+1
-                    WHERE channel_id=? AND date=?
+                    SET reserved_count=reserved_count-1,sent_count=sent_count+1
+                    WHERE channel_id=? AND date=? AND reserved_count>0
                 """, (row["channel_id"], row["channel_slot_date"]))
             if row["recipient_pool_id"]:
                 cur.execute("""
@@ -1969,39 +2272,158 @@ def _recover_stale_sending_claims():
                     SET status='sent',sent_at=?,updated_at=?
                     WHERE id=? AND reserved_task_id=?
                 """, (accepted_at, accepted_at, row["recipient_pool_id"], row["task_id"]))
-        stale_slots = cur.execute("""
-            SELECT channel_id, channel_slot_date, COUNT(*) AS c
-            FROM scheduled_email_tasks s
-            WHERE s.status='sending' AND (s.claimed_at IS NULL OR s.claimed_at <= ?)
-              AND EXISTS (
-                  SELECT 1 FROM mail_tasks m
-                  WHERE m.id=s.task_id AND m.task_kind='legacy'
-              )
-              AND channel_slot_date IS NOT NULL
-            GROUP BY channel_id, channel_slot_date
-        """, (cutoff,)).fetchall()
-        for row in stale_slots:
-            cur.execute("""
-                UPDATE channel_daily_stats
-                SET reserved_count=MAX(0, reserved_count - ?)
-                WHERE channel_id=? AND date=?
-            """, (int(row["c"]), row["channel_id"], row["channel_slot_date"]))
+        # No durable success record does not prove the request was unsent. Keep
+        # channel capacity and recipient reserved until an admin checks SendGrid.
         cur.execute("""
             UPDATE scheduled_email_tasks
-            SET status='pending', worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL,
+            SET status='needs_review', worker_id=NULL,
                 last_error=CASE
-                    WHEN last_error IS NULL OR last_error='' THEN 'Recovered stale worker claim'
-                    ELSE last_error || ' | Recovered stale worker claim'
+                    WHEN last_error IS NULL OR last_error='' THEN 'Worker stopped during send; review provider outcome'
+                    ELSE last_error || ' | Worker stopped during send; review provider outcome'
                 END
-            WHERE status='sending' AND (claimed_at IS NULL OR claimed_at <= ?)
+            WHERE status='sending' AND (claimed_epoch IS NULL OR claimed_epoch <= ?)
               AND EXISTS (
                   SELECT 1 FROM mail_tasks m
                   WHERE m.id=scheduled_email_tasks.task_id AND m.task_kind='legacy'
               )
-        """, (cutoff,))
+        """, (cutoff_epoch,))
         recovered = cur.rowcount
         conn.commit()
         return recovered + len(logged_successes)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _legacy_recipient_still_allowed(cur, schedule):
+    """Recheck opt-outs and reservation ownership immediately before HTTP."""
+    email = (schedule["recipient_email"] or "").strip().lower()
+    if not email or cur.execute("""
+        SELECT 1 FROM sendgrid_events
+        WHERE lower(trim(email))=?
+          AND lower(event_type) IN ('unsubscribe','group_unsubscribe','spamreport','spam report','bounce')
+        LIMIT 1
+    """, (email,)).fetchone():
+        return False
+    if not schedule.get("recipient_pool_id"):
+        return True  # Old plans made before the reusable pool was introduced.
+    pool = cur.execute("""
+        SELECT p.tag_id,p.email,p.pool_type,p.status,p.reserved_task_id
+        FROM recipient_pool p WHERE p.id=?
+    """, (schedule["recipient_pool_id"],)).fetchone()
+    if (not pool or pool["status"] != "reserved" or pool["reserved_task_id"] != schedule["task_id"]
+            or pool["tag_id"] != schedule["tag_id"] or pool["email"].strip().lower() != email):
+        return False
+    if pool["pool_type"] == "warmup_named" and not cur.execute("""
+        SELECT 1 FROM recipient_pool_list_members lm JOIN recipient_lists l ON l.id=lm.list_id
+        WHERE lm.pool_id=? AND l.tag_id=? AND l.status='active'
+          AND l.consent_source IS NOT NULL AND l.consented_at IS NOT NULL LIMIT 1
+    """, (schedule["recipient_pool_id"], schedule["tag_id"])).fetchone():
+        return False
+    return True
+
+
+def _settle_legacy_send(schedule, worker_id, slot_date, ok, raw, error, uncertain):
+    """Commit result, daily capacity and recipient state as one transaction."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        current = cur.execute("""
+            SELECT * FROM scheduled_email_tasks WHERE id=? AND status='sending' AND worker_id=?
+        """, (schedule["id"], worker_id)).fetchone()
+        if not current:
+            conn.commit()
+            return False
+        result = "needs_review" if uncertain else ("sent" if ok else "failed")
+        stamp = now_iso()
+        cur.execute("""
+            UPDATE scheduled_email_tasks SET status=?,attempts=attempts+1,
+                sent_at=?,sender_response=?,last_error=?,worker_id=NULL,
+                claimed_at=?,claimed_epoch=?,channel_slot_date=?
+            WHERE id=? AND status='sending' AND worker_id=?
+        """, (result, stamp if ok else None, str(raw or "")[:10000], error,
+              current["claimed_at"] if uncertain else None,
+              current["claimed_epoch"] if uncertain else None,
+              slot_date if uncertain else None, schedule["id"], worker_id))
+        if not uncertain:
+            if slot_date:
+                cur.execute("""
+                    UPDATE channel_daily_stats
+                    SET reserved_count=MAX(0,reserved_count-1),
+                        sent_count=sent_count+?,failed_count=failed_count+?,
+                        last_error=CASE WHEN ?=1 THEN last_error ELSE ? END
+                    WHERE channel_id=? AND date=?
+                """, (1 if ok else 0, 0 if ok else 1, 1 if ok else 0,
+                      error, schedule["channel_id"], slot_date))
+            if schedule.get("recipient_pool_id"):
+                if ok:
+                    cur.execute("""
+                        UPDATE recipient_pool SET status='sent',sent_at=?,updated_at=?
+                        WHERE id=? AND reserved_task_id=? AND status='reserved'
+                    """, (stamp, stamp, schedule["recipient_pool_id"], schedule["task_id"]))
+                else:
+                    cur.execute("""
+                        UPDATE recipient_pool SET status='failed',reserved_task_id=NULL,
+                            reserved_schedule_id=NULL,reserved_at=NULL,updated_at=?
+                        WHERE id=? AND reserved_task_id=? AND status='reserved'
+                    """, (stamp, schedule["recipient_pool_id"], schedule["task_id"]))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_legacy_review(schedule_id, resolution):
+    """Reconcile an uncertain legacy send while preserving its capacity hold."""
+    if resolution not in ("accepted", "failed"):
+        raise ValueError("核销结果必须为已接受或明确失败。")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT s.* FROM scheduled_email_tasks s JOIN mail_tasks m ON m.id=s.task_id
+            WHERE s.id=? AND m.task_kind='legacy' AND s.status='needs_review'
+        """, (schedule_id,)).fetchone()
+        if not row:
+            raise ValueError("邮件不处于待人工核销状态。")
+        accepted = resolution == "accepted"
+        stamp = now_iso()
+        cur.execute("""
+            UPDATE scheduled_email_tasks
+            SET status=?,sent_at=?,last_error=?,worker_id=NULL,
+                channel_slot_date=NULL,claimed_at=NULL,claimed_epoch=NULL
+            WHERE id=? AND status='needs_review'
+        """, ("sent" if accepted else "failed", stamp if accepted else None,
+              "Manually resolved: " + resolution, schedule_id))
+        if row["channel_slot_date"]:
+            cur.execute("""
+                UPDATE channel_daily_stats
+                SET reserved_count=MAX(0,reserved_count-1),
+                    sent_count=sent_count+?,failed_count=failed_count+?
+                WHERE channel_id=? AND date=?
+            """, (1 if accepted else 0, 0 if accepted else 1,
+                  row["channel_id"], row["channel_slot_date"]))
+        if row["recipient_pool_id"]:
+            if accepted:
+                cur.execute("""
+                    UPDATE recipient_pool SET status='sent',sent_at=?,updated_at=?
+                    WHERE id=? AND reserved_task_id=? AND status='reserved'
+                """, (stamp, stamp, row["recipient_pool_id"], row["task_id"]))
+            else:
+                cur.execute("""
+                    UPDATE recipient_pool SET status='failed',reserved_task_id=NULL,
+                        reserved_schedule_id=NULL,reserved_at=NULL,updated_at=?
+                    WHERE id=? AND reserved_task_id=? AND status='reserved'
+                """, (stamp, row["recipient_pool_id"], row["task_id"]))
+        conn.commit()
+        return True
     except Exception:
         conn.rollback()
         raise
@@ -2020,6 +2442,10 @@ def process_due_tasks(limit):
           AND m.status='running'
           AND m.task_kind='legacy'
           AND s.scheduled_at <= ?
+          AND NOT EXISTS (
+              SELECT 1 FROM scheduled_email_tasks active
+              WHERE active.task_id=s.task_id AND active.status IN ('sending','needs_review')
+          )
         ORDER BY s.scheduled_at ASC, s.id ASC
         LIMIT ?
     """, (now_value, max(1, int(limit))))
@@ -2030,73 +2456,85 @@ def process_due_tasks(limit):
         claimed_at = now_iso()
         claimed = execute_rowcount("""
             UPDATE scheduled_email_tasks
-            SET status='sending', claimed_at=?, worker_id=?
+            SET status='sending', claimed_at=?, claimed_epoch=?, worker_id=?
             WHERE id=? AND status='pending' AND scheduled_at <= ?
               AND EXISTS (
                   SELECT 1 FROM mail_tasks m
                   WHERE m.id=scheduled_email_tasks.task_id AND m.status='running'
                     AND m.task_kind='legacy'
               )
-        """, (claimed_at, worker_id, task["id"], now_value))
+              AND NOT EXISTS (
+                  SELECT 1 FROM scheduled_email_tasks active
+                  WHERE active.task_id=scheduled_email_tasks.task_id
+                    AND active.status IN ('sending','needs_review')
+              )
+        """, (claimed_at, int(time.time()), worker_id, task["id"], now_value))
         if claimed != 1:
             continue
 
         task = q_one("SELECT * FROM scheduled_email_tasks WHERE id=?", (task["id"],)) or task
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            if not _legacy_recipient_still_allowed(cur, task):
+                cur.execute("""
+                    UPDATE scheduled_email_tasks
+                    SET status='missed',last_error='Recipient suppressed or source disabled',
+                        worker_id=NULL,claimed_at=NULL,claimed_epoch=NULL
+                    WHERE id=? AND status='sending' AND worker_id=?
+                """, (task["id"], worker_id))
+                if task.get("recipient_pool_id"):
+                    cur.execute("""
+                        UPDATE recipient_pool SET status='available',reserved_task_id=NULL,
+                            reserved_schedule_id=NULL,reserved_at=NULL,updated_at=?
+                        WHERE id=? AND reserved_task_id=? AND status='reserved'
+                    """, (now_iso(), task["recipient_pool_id"], task["task_id"]))
+                conn.commit()
+                processed += 1
+                continue
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
         channel = q_one("SELECT * FROM send_channels WHERE id=?", (task["channel_id"],))
         slot_date = None
-        if channel and channel.get("status") == "active":
+        if channel and channel.get("status") == "active" and channel["tag_id"] == task["tag_id"]:
             slot_date = _reserve_channel_slot(
                 channel["id"], channel.get("daily_limit") or 1, task["id"], worker_id
             )
 
-        if channel and channel.get("status") == "active" and not slot_date:
+        if channel and channel.get("status") == "active" and channel["tag_id"] == task["tag_id"] and not slot_date:
             execute("""
                 UPDATE scheduled_email_tasks
-                SET status='pending', scheduled_at=?, last_error=?, worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL
+                SET status='pending', scheduled_at=?, last_error=?, worker_id=NULL,
+                    claimed_at=NULL,claimed_epoch=NULL,channel_slot_date=NULL
                 WHERE id=? AND status='sending' AND worker_id=?
             """, (_next_day_retry_at(), "Channel daily limit reached", task["id"], worker_id))
             processed += 1
             continue
 
         if not channel:
-            ok, msg_id, err, raw = False, None, "Channel not found", None
-        elif channel.get("status") != "active":
-            ok, msg_id, err, raw = False, None, "Channel is not active", None
+            ok, msg_id, err, raw = False, None, "Channel not found", "NOT_SENT"
+        elif channel.get("status") != "active" or channel["tag_id"] != task["tag_id"]:
+            ok, msg_id, err, raw = False, None, "Channel inactive or tag mismatch", "NOT_SENT"
         else:
-            ok, msg_id, err, raw = _send_via_sendgrid(task)
+            try:
+                ok, msg_id, err, raw = _send_via_sendgrid(task)
+            except Exception as exc:
+                ok, msg_id, err, raw = False, None, str(exc)[:500], None
 
-        if slot_date:
-            _complete_channel_slot(channel["id"], slot_date, ok, err)
-
-        if ok:
-            sent_at = now_iso()
-            updated = execute_rowcount("""
-                UPDATE scheduled_email_tasks
-                SET status='sent', sent_at=?, sender_response=?, worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL
-                WHERE id=? AND status='sending' AND worker_id=?
-            """, (sent_at, raw or msg_id or "", task["id"], worker_id))
-            if updated == 1 and task.get("recipient_pool_id"):
-                execute("""
-                    UPDATE recipient_pool
-                    SET status='sent', sent_at=?, updated_at=?
-                    WHERE id=? AND reserved_task_id=?
-                """, (sent_at, sent_at, task["recipient_pool_id"], task["task_id"]))
-        else:
-            attempts = int(task.get("attempts") or 0) + 1
-            status = "failed" if attempts >= 3 else "pending"
-            retry_at = (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")
-            updated = execute_rowcount("""
-                UPDATE scheduled_email_tasks
-                SET status=?, attempts=?, scheduled_at=?, last_error=?, sender_response=?,
-                    worker_id=NULL, claimed_at=NULL, channel_slot_date=NULL
-                WHERE id=? AND status='sending' AND worker_id=?
-            """, (status, attempts, retry_at, err, raw, task["id"], worker_id))
-            if updated == 1 and status == "failed" and task.get("recipient_pool_id"):
-                execute("""
-                    UPDATE recipient_pool
-                    SET status='failed', updated_at=?
-                    WHERE id=? AND reserved_task_id=?
-                """, (now_iso(), task["recipient_pool_id"], task["task_id"]))
+        uncertain = not ok and raw is None
+        if not ok and not uncertain and raw != "NOT_SENT":
+            log = q_one("""
+                SELECT http_status FROM send_log WHERE scheduled_task_id=? ORDER BY id DESC LIMIT 1
+            """, (task["id"],))
+            http_status = log.get("http_status") if log else None
+            uncertain = http_status in (408, 429) or (http_status is not None and http_status >= 500)
+        _settle_legacy_send(task, worker_id, slot_date, ok, raw or msg_id, err, uncertain)
         processed += 1
     return processed
 
